@@ -311,21 +311,68 @@ const firebaseAdapter={
   const {fsm,db}=fb;
   unsub.forEach(f=>f());unsub=[];
   STORE.products=[];STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.recounts=[];STORE.recountEntries=[];STORE.profiles=[];
-  STORE.ready=false;STORE.connected=false;
-  const stockCache=new Map(), received=new Set();
-  const required=role==='supervisor'?['catalog','stock','counts','markers','profiles','surplus','recounts','recount_entries']:['catalog','counts','markers','surplus','recounts','recount_entries'];
-  const watch=(key,ref,fn)=>unsub.push(fsm.onSnapshot(ref,snap=>{
-    fn(snap.docs.map(d=>({id:d.id,...d.data()})));
-    received.add(key);
-    STORE.ready=required.every(k=>received.has(k));
-    STORE.connected=STORE.ready;
-    scheduleRender();
-  },e=>{
+  STORE.ready=false;STORE.connected=false;STORE.syncIssue=null;
+  const stockCache=new Map(), received=new Set(), reported=new Set();
+  // Solo los datos indispensables deben bloquear el conteo. Las colecciones nuevas
+  // (sobrantes y reconteos) pueden requerir reglas actualizadas; no paralizan inventarios.
+  const required=role==='supervisor'?['catalog','stock','counts','markers']:
+                 role==='recount'?['catalog','recounts','recount_entries']:
+                 ['catalog','counts','markers'];
+  let syncTimer=null, sessionStopped=false;
+  const friendly=(key,e)=>{
+    const raw=String(e?.message||e||'Error de conexión');
+    const desc=key==='stock'?'existencias teóricas':key==='catalog'?'catálogo':
+      key==='counts'?'conteos':key==='markers'?'avance':
+      key==='recounts'?'cola de reconteo':key==='recount_entries'?'registros de reconteo':
+      key==='surplus'?'sobrantes':key==='profiles'?'perfiles':key;
+    return (e?.code==='permission-denied'||raw.includes('permission'))?
+      `Sin permiso de Firestore para ${desc}. Revisa las reglas de ese módulo. No se ha eliminado ningún conteo.`:
+      `No se pudo consultar ${desc}: ${raw}`;
+  };
+  const setFailure=message=>{
+    if(sessionStopped)return;
+    clearTimeout(syncTimer);
+    STORE.syncIssue=message;
     STORE.ready=false;STORE.connected=false;
-    console.error('PuntoFarma Firebase / '+key,e);
-    const detail=escapeHtml(e.message||String(e));
-    app.innerHTML='<main class="boot" style="padding:24px;text-align:center"><h2>No se pudo sincronizar Firebase</h2><p style="max-width:600px;color:#617e8e">'+detail+'</p><p style="max-width:640px;color:#617e8e">Revisa Firestore → Reglas y Authentication → Método de acceso. El inventario no se guardó localmente.</p><button class="btn btn-primary" onclick="location.reload()">Reintentar conexión</button></main>';
-  }));
+    render();
+  };
+  const updateReady=()=>{
+    if(sessionStopped||STORE.syncIssue)return;
+    const ready=required.every(k=>received.has(k));
+    STORE.ready=ready;STORE.connected=ready;
+    if(ready)clearTimeout(syncTimer);
+    scheduleRender();
+  };
+  syncTimer=setTimeout(()=>{
+    if(sessionStopped||STORE.ready||STORE.syncIssue)return;
+    const missing=required.filter(k=>!received.has(k));
+    setFailure(`Firebase no terminó de responder después de 20 segundos. Falta sincronizar: ${missing.join(', ')}. Comprueba la conexión o vuelve a intentarlo.`);
+  },20000);
+  const watch=(key,ref,fn)=>{
+    try{
+      const stop=fsm.onSnapshot(ref,snap=>{
+        if(sessionStopped||STORE.syncIssue)return;
+        fn(snap.docs.map(d=>({id:d.id,...d.data()})));
+        received.add(key);
+        updateReady();
+      },e=>{
+        if(sessionStopped)return;
+        console.error('PuntoFarma Firebase / '+key,e);
+        const message=friendly(key,e);
+        if(required.includes(key)){
+          setFailure(message);
+        }else if(!reported.has(key)){
+          reported.add(key);
+          notify('Módulo no disponible: '+message,'error');
+        }
+      });
+      unsub.push(()=>{sessionStopped=true;clearTimeout(syncTimer);stop()});
+    }catch(e){
+      console.error('PuntoFarma Firebase / '+key,e);
+      if(required.includes(key))setFailure(friendly(key,e));
+      else notify(friendly(key,e),'error');
+    }
+  };
   watch('catalog',fsm.collection(db,'catalog'),rows=>{
     STORE.products=rows.map(p=>role==='supervisor'?{...p,...(stockCache.get(p.id)||{})}:publicProduct(p));
   });
@@ -387,7 +434,9 @@ function signOut(){if(STORE.appMode==='firebase')adapter.signOut().catch(console
 function entryMarkup(){let hasAdmin=STORE.profiles.some(p=>p.role==='supervisor');return `<div class="entry"><section class="entry-art"><div class="brand">${logo()}</div><div class="entry-illustration"><div class="entry-orbit"></div><div class="entry-circle">${I('inventory')}</div></div><div><h1>Tu inventario,<br><em>bajo control.</em></h1><div class="entry-art-footer">PUNTOFARMA · INVENTORY CONTROL · ECUADOR</div></div></section><section class="entry-right"><div class="entry-content">${!STATE.loginType?`<span class="eyebrow">Bienvenido a PuntoFarma</span><h2>¿Cómo deseas ingresar?</h2><button class="role-card" data-action="role" data-role="supervisor"><span class="role-icon">${I('shield')}</span><span><strong>Supervisión</strong><small>Administración y control de inventario</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="operator"><span class="role-icon lime">${I('inventory')}</span><span><strong>Conteo físico</strong><small>Registro de productos desde celular</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="recount"><span class="role-icon lime">${I('refresh')}</span><span><strong>Reconteo</strong><small>Revisión de códigos con novedades</small></span>${I('arrow','arrow-circle')}</button>`:(STATE.loginType==='operator'||STATE.loginType==='recount')?`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">${STATE.loginType==='recount'?'Reconteo':'Conteo físico'}</span><h2>${STATE.loginType==='recount'?'Vamos a revisar novedades':'Comencemos el inventario'}</h2><form class="form-stack" data-form="worker-login"><div class="field"><label>Tu nombre y apellido</label><input class="input" name="displayName" placeholder="Ej. María Rodríguez" required minlength="3" autocomplete="name" autofocus></div><button class="btn btn-primary btn-block">Ingresar al conteo ${I('arrow')}</button></form>`:`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">Acceso administrativo</span><h2>${STORE.appMode==='demo'&&!hasAdmin?'Configura el supervisor':'Acceso a Supervisión'}</h2><form class="form-stack" data-form="${STORE.appMode==='demo'&&!hasAdmin?'first-admin':'admin-login'}"><div class="field"><label>Usuario</label><input class="input" name="username" required placeholder="Ej. admin" minlength="3" autocomplete="username"></div>${STORE.appMode==='demo'&&!hasAdmin?`<div class="field"><label>Nombre visible</label><input class="input" name="displayName" required placeholder="Ej. Supervisor PuntoFarma"></div>`:''}<div class="field"><label>Contraseña</label><input class="input" name="password" type="password" required minlength="4" placeholder="Tu contraseña" autocomplete="${STORE.appMode==='demo'&&!hasAdmin?'new-password':'current-password'}"></div><button class="btn btn-primary btn-block">${STORE.appMode==='demo'&&!hasAdmin?'Crear supervisor':'Iniciar sesión'} ${I('arrow')}</button></form>`}</div></section></div>`}
 function render(){
  if(STATE.screen==='access'){app.innerHTML=entryMarkup();return}
- if(STORE.appMode==='firebase'&&!STORE.ready){app.innerHTML='<main class="boot"><div class="loader"></div><strong>Sincronizando inventario…</strong></main>';return}
+ if(STORE.appMode==='firebase'&&!STORE.ready){
+   if(STORE.syncIssue){app.innerHTML=`<main class="boot" style="padding:22px;text-align:center"><h2>Problema de sincronización</h2><p style="max-width:560px;line-height:1.6;color:#426578">${escapeHtml(STORE.syncIssue)}</p><div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:12px"><button class="btn btn-primary" onclick="location.reload()">Reintentar conexión</button><button class="btn btn-outline" data-action="logout">Volver al inicio</button></div></main>`;return}
+   app.innerHTML='<main class="boot"><div class="loader"></div><strong>Sincronizando inventario…</strong><p style="color:#698498;font-size:12px">Verificando catálogo y conteos de Firebase.</p></main>';return} 
  app.innerHTML=STORE.role==='recount'?recountMarkup():STORE.role==='operator'?workerMarkup():adminShell();
 }
 function adminShell(){const route=STATE.panel;return `<div class="shell"><aside class="sidebar ${STATE.collapsed?'collapsed':''}"><div class="sidebar-top"><span class="compact-only brand-mark">P</span><div class="brand-lockup">${logo(true)}</div><button class="btn btn-outline btn-icon" title="${STATE.collapsed?'Expandir':'Plegar'} menú" data-action="collapse">${I('menuopen')}</button></div><div class="side-body"><div class="side-section-label">ADMINISTRACIÓN</div>${Object.entries(sheetNames).map(([key,name])=>`<button class="nav-link ${route===key?'selected':''}" data-action="nav" data-route="${key}" title="${escapeHtml(name)}">${I(navIcons[key])}<span class="nav-text">${name}</span></button>`).join('')}</div><div class="sidebar-footer"><div class="sidebar-user">${avatar(STORE.user.displayName)}<div class="sidebar-user-details"><b>${escapeHtml(STORE.user.displayName||'Supervisor')}</b><small>Supervisión · PuntoFarma</small></div></div><button class="btn btn-outline" data-action="logout" style="width:100%;margin-top:9px">${I('exit')}<span>Salir</span></button></div></aside><main class="main"><header class="topbar"><div class="topbar-left"><span class="crumb">PuntoFarma <span class="muted">/</span> <strong>${sheetNames[route]}</strong></span></div><div class="topbar-right">${badgeConnection()}<span class="pill">${I('user')} ${escapeHtml(STORE.user.username||'Supervisor')}</span></div></header><div class="page" id="route-content">${adminContent()}</div></main></div>`}
