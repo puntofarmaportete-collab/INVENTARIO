@@ -239,14 +239,14 @@ const debounce=(fn,t=150)=>{let tm;return(...a)=>{clearTimeout(tm);tm=setTimeout
 // Ahorro Firestore: señales ligeras para el catálogo y caché del avance en celulares.
 const SYNC_DOC='__pf_catalog_version__';
 const CACHE_NS='PF_FIRESTORE_CACHE_'+String(window.PF_FIREBASE_CONFIG?.projectId||'local')+'_';
-const CACHE_MAX_AGE_MS=24*60*60*1000;
+const CACHE_MAX_AGE_MS=8*60*60*1000;
 function readCache(key){try{return JSON.parse(localStorage.getItem(CACHE_NS+key)||'null')}catch{return null}}
 function writeCache(key,value){try{localStorage.setItem(CACHE_NS+key,JSON.stringify(value))}catch(e){console.warn('Caché local no disponible',e)}}
 const sheetNames={dashboard:'Control de inventario',inventory:'Mi inventario',expiry:'Caducidades',users:'Configuración'};
 const navIcons={dashboard:'dashboard',inventory:'inventory',expiry:'calendar',users:'users'};
 const STORE={products:[],counts:[],surplus:[],markers:[],recounts:[],recountEntries:[],profiles:[],appMode:'demo',user:null,uid:null,role:null,connected:false,ready:false};
 const STATE={screen:'access',loginType:'',panel:'dashboard',collapsed:localStorage.getItem(PREFIX+'collapsed')==='true',query:'',status:'all',invQuery:'',expiryQuery:'',expiryRange:'all',page:0,invPage:0,selected:null,workerQuery:'',workerTab:'count',workerName:'',busy:false,editCountId:null,recountSelection:new Set(),recountActiveId:null,recountQuery:''};
-let adapter=null, unsub=[], toastTimer, refreshMarkerProgress=null, refreshSupervisorFeeds=null;
+let adapter=null, unsub=[], toastTimer, refreshMarkerProgress=null;
 let INVOICE_REVIEW=null;
 const app=document.getElementById('app');
 const clone=v=>JSON.parse(JSON.stringify(v));
@@ -421,15 +421,15 @@ const firebaseAdapter={
  },
  async start(role,uid){
   const {fsm,db}=fb;
-  unsub.forEach(f=>f());unsub=[];refreshMarkerProgress=null;refreshSupervisorFeeds=null;
+  unsub.forEach(f=>f());unsub=[];refreshMarkerProgress=null;
   STORE.products=[];STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.recounts=[];STORE.recountEntries=[];STORE.profiles=[];
-  STORE.ready=false;STORE.connected=false;STORE.syncIssue=null;STORE.progressReady=false;
+  STORE.ready=false;STORE.connected=false;STORE.syncIssue=null;
   const received=new Set(),reported=new Set();
   // Los catálogos y el stock cambian poco: ya NO dejamos escuchas en vivo de
   // cientos de documentos. Una señal de un documento anuncia cuándo refrescar.
   const required=role==='supervisor'?['catalog','stock','counts']:
                  role==='recount'?['catalog','recounts']:
-                 ['catalog','counts'];
+                 ['catalog','counts','markers'];
   let syncTimer=null, sessionStopped=false, lastCatalogVersion=null, catalogVersionSeen=false;
   let refreshingCatalog=Promise.resolve(), refreshBusy=false;
   const friendly=(key,e)=>{
@@ -569,108 +569,49 @@ const firebaseAdapter={
        if(role==='supervisor')STORE.markers=a.map(c=>({id:c.id,skuId:c.skuId,uid:c.uid,createdAt:c.createdAt}));
     });
   }
-  // AVANCE MÓVIL: conservar el conjunto completo en caché (24h), consultar
-  // solamente marcadores creados después del último recibido y leer todo
-  // únicamente al no tener caché o al pulsar «Actualizar».
-  // Nunca se altera counts, ni se publica el teórico a los colaboradores.
+  // El supervisor deduce el avance de counts; no necesita leer otra vez markers.
+  // El colaborador utiliza caché del avance + una escucha limitada a los últimos 80.
   if(role==='operator'){
-    let markerMap=new Map(),markerCache=readCache('markers');
-    let fullAt=Number(markerCache?.fullAt||0);
-    let lastMarkerDate='';
-    const persistMarkers=debounce(()=>writeCache('markers',{
-      fullAt,watermark:lastMarkerDate,rows:[...markerMap.values()]
-    }),2200);
-    const setMarkers=(rows)=>{
-      markerMap=new Map(rows.map(m=>[m.id,m]));
-      lastMarkerDate=[...markerMap.values()].reduce((max,m)=>
-        String(m.createdAt||'')>max?String(m.createdAt||''):max,'');
-      STORE.markers=[...markerMap.values()];STORE.progressReady=true;
-      persistMarkers();scheduleRender();
-    };
-    const startIncremental=()=>{
-      if(sessionStopped)return;
-      // No usar limit(80): volvía a leer 80 documentos por reconexión.
-      // Una consulta por fecha devuelve solo los registros aún no cacheados.
-      const q=fsm.query(fsm.collection(db,'markers'),fsm.where('createdAt','>',lastMarkerDate));
-      watch('markers_delta',q,rows=>{
-        let changed=false;
-        for(const m of rows){if(!markerMap.has(m.id)){markerMap.set(m.id,m);changed=true}}
-        if(changed){
-          lastMarkerDate=[...markerMap.values()].reduce((max,m)=>
-            String(m.createdAt||'')>max?String(m.createdAt||''):max,lastMarkerDate);
-          STORE.markers=[...markerMap.values()];STORE.progressReady=true;
-          persistMarkers();scheduleRender();
-        }
-      });
-    };
+    let markerMap=new Map(),markerCache=readCache('markers'),fullAt=Number(markerCache?.fullAt||0);
+    const persistMarkers=debounce(()=>writeCache('markers',{fullAt,rows:[...markerMap.values()]}),2000);
+    if(markerCache && Array.isArray(markerCache.rows) && Date.now()-fullAt<CACHE_MAX_AGE_MS){
+      markerMap=new Map(markerCache.rows.map(m=>[m.id,m]));
+      STORE.markers=[...markerMap.values()];
+      received.add('markers');updateReady();
+    }else{
+      const fetchStarted=now();
+      fsm.getDocs(fsm.collection(db,'markers')).then(snap=>{
+        if(sessionStopped)return;
+        // Refresco completo para quitar marcas antiguas eliminadas; preservar
+        // solamente altas que se recibieron mientras se hacía la consulta.
+        const recent=[...markerMap.values()].filter(m=>String(m.createdAt||'')>=fetchStarted);
+        markerMap=new Map(snap.docs.map(d=>[d.id,{id:d.id,...d.data()}]));
+        for(const m of recent)markerMap.set(m.id,m);
+        fullAt=Date.now();
+        STORE.markers=[...markerMap.values()];received.add('markers');
+        persistMarkers();updateReady();
+      }).catch(e=>{if(!sessionStopped)setFailure(friendly('markers',e))});
+    }
+    // Ante un borrado del propio colaborador, verificar inmediatamente el avance:
+    // no permitir que una marca vieja siga figurando como contada en la caché.
     refreshMarkerProgress=async()=>{
       const snap=await fsm.getDocs(fsm.collection(db,'markers'));
       if(sessionStopped)return;
-      fullAt=Date.now();
-      setMarkers(snap.docs.map(d=>({id:d.id,...d.data()})));
-      writeCache('markers',{fullAt,watermark:lastMarkerDate,rows:STORE.markers});
+      markerMap=new Map(snap.docs.map(d=>[d.id,{id:d.id,...d.data()}]));
+      fullAt=Date.now();STORE.markers=[...markerMap.values()];
+      writeCache('markers',{fullAt,rows:STORE.markers});
+      scheduleRender();
     };
-    if(markerCache&&Array.isArray(markerCache.rows)&&Date.now()-fullAt<CACHE_MAX_AGE_MS){
-      markerMap=new Map(markerCache.rows.map(m=>[m.id,m]));
-      lastMarkerDate=String(markerCache.watermark||'')||[...markerMap.values()].reduce((max,m)=>
-        String(m.createdAt||'')>max?String(m.createdAt||''):max,'');
-      STORE.markers=[...markerMap.values()];STORE.progressReady=true;
-      startIncremental();
-    }else{
-      refreshMarkerProgress().then(startIncremental).catch(e=>{
-        if(sessionStopped)return;
-        console.warn('PuntoFarma / avance global',e);
-        STORE.progressReady=false;
-        notify('El avance general no pudo actualizarse. Puedes seguir contando y reintentar con Actualizar.','error');
-      });
-    }
-  }
-  // SUPERVISIÓN: las colecciones auxiliares solo se escuchan al entrar a
-  // la sección que las necesita. El conteo físico sigue EN VIVO siempre.
-  if(role==='supervisor'){
-    const liveStops=new Map();
-    const configs={
-      surplus:()=>[fsm.collection(db,'surplus'),a=>STORE.surplus=a],
-      recounts:()=>[fsm.collection(db,'recounts'),a=>STORE.recounts=a],
-      recount_entries:()=>[fsm.collection(db,'recount_entries'),a=>STORE.recountEntries=a],
-      profiles:()=>[fsm.collection(db,'profiles'),a=>STORE.profiles=a]
-    };
-    const routes={dashboard:['surplus','recounts','recount_entries'],
-      inventory:['surplus'],expiry:['surplus'],users:['profiles']};
-    refreshSupervisorFeeds=(route)=>{
-      if(sessionStopped)return;
-      const needed=new Set(routes[route]||routes.dashboard);
-      for(const [key,stop] of liveStops){
-        if(!needed.has(key)){stop();liveStops.delete(key)}
-      }
-      for(const key of needed){
-        if(liveStops.has(key))continue;
-        const [reference,apply]=configs[key]();
-        try{
-          const stop=fsm.onSnapshot(reference,snap=>{
-            if(sessionStopped||!liveStops.has(key))return;
-            apply(snap.docs.map(d=>({id:d.id,...d.data()})));
-            received.add(key);updateReady();
-          },e=>{
-            if(sessionStopped)return;
-            console.error('PuntoFarma Firebase / '+key,e);
-            const message=friendly(key,e);
-            if(required.includes(key)&&!STORE.ready)setFailure(message);
-            else if(!reported.has(key)){reported.add(key);notify('Módulo no disponible: '+message,'error')}
-          });
-          liveStops.set(key,stop);
-        }catch(e){
-          console.error('PuntoFarma Firebase / '+key,e);
-          if(required.includes(key)&&!STORE.ready)setFailure(friendly(key,e));
-          else notify(friendly(key,e),'error');
-        }
-      }
-    };
-    unsub.push(()=>{
-      for(const stop of liveStops.values())stop();
-      liveStops.clear();refreshSupervisorFeeds=null;
+    watch('markers_recent',fsm.query(fsm.collection(db,'markers'),fsm.orderBy('createdAt','desc'),fsm.limit(80)),rows=>{
+      rows.forEach(m=>markerMap.set(m.id,m));
+      STORE.markers=[...markerMap.values()];persistMarkers();
     });
-    refreshSupervisorFeeds(STATE.panel);
+  }
+  if(role==='supervisor'){
+    watch('profiles',fsm.collection(db,'profiles'),a=>STORE.profiles=a);
+    watch('surplus',fsm.collection(db,'surplus'),a=>STORE.surplus=a);
+    watch('recounts',fsm.collection(db,'recounts'),a=>STORE.recounts=a);
+    watch('recount_entries',fsm.collection(db,'recount_entries'),a=>STORE.recountEntries=a);
   }else if(role==='operator'){
     watch('surplus',fsm.query(fsm.collection(db,'surplus'),fsm.where('uid','==',uid)),a=>STORE.surplus=a);
   }else if(role==='recount'){
@@ -678,7 +619,7 @@ const firebaseAdapter={
     watch('recount_entries',fsm.query(fsm.collection(db,'recount_entries'),fsm.where('uid','==',uid)),a=>STORE.recountEntries=a);
   }
  },
- async signOut(){unsub.forEach(f=>f());unsub=[];refreshMarkerProgress=null;refreshSupervisorFeeds=null;await fb.authm.signOut(fb.auth)}
+ async signOut(){unsub.forEach(f=>f());unsub=[];refreshMarkerProgress=null;await fb.authm.signOut(fb.auth)}
 };
 function loginEmail(u){
   if(!/^[a-z0-9._-]{3,32}$/i.test(u.trim()))throw Error('Usuario: utiliza de 3 a 32 caracteres válidos.');
@@ -891,7 +832,7 @@ function inventoryTable(){let rows=STORE.products.filter(p=>matches(p,STATE.invQ
 function expiryMarkup(){let c=[...STORE.counts.map(x=>({...x,product:STORE.products.find(p=>p.id===x.skuId)})),...STORE.surplus.map(x=>({...x,isSurplus:true,position:'—',product:{name:x.productName,code:x.code}}))].filter(x=>x.expiry&&validDate(x.expiry));const expir=c.filter(x=>daysTo(x.expiry)<0),d30=c.filter(x=>daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30),d60=c.filter(x=>daysTo(x.expiry)>30&&daysTo(x.expiry)<=60),d90=c.filter(x=>daysTo(x.expiry)>60&&daysTo(x.expiry)<=90);let filtered=c.filter(x=>(STATE.expiryRange==='all'||(STATE.expiryRange==='expired'&&daysTo(x.expiry)<0)||(STATE.expiryRange==='30'&&daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30)||(STATE.expiryRange==='60'&&daysTo(x.expiry)>30&&daysTo(x.expiry)<=60)||(STATE.expiryRange==='90'&&daysTo(x.expiry)>60&&daysTo(x.expiry)<=90))&&matches(x.product||{},STATE.expiryQuery,[x.position,x.expiry,x.name].join(' '))).sort((a,b)=>a.expiry.localeCompare(b.expiry));return `${header('Caducidades','Control de fechas de vencimiento a partir de los conteos físicos registrados.',`<button class="btn btn-outline" data-action="export-expiry">${I('download')} Exportar reporte</button>`)}<div class="kpi-grid">${kpi('Vencidos',nfmt(expir.reduce((a,x)=>a+Number(x.qty),0)),'alert','red',`${expir.length} registros`)}${kpi('Próx. 30 días',nfmt(d30.reduce((a,x)=>a+Number(x.qty),0)),'clock','amber',`${d30.length} registros`)}${kpi('Entre 31 y 60',nfmt(d60.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}${kpi('Entre 61 y 90',nfmt(d90.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}</div><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Vencimientos por caja</h3></div></div><div class="toolbar" style="margin-bottom:13px"><div class="search-wrap">${I('search')}<input class="input" id="expiry-search" placeholder="Buscar producto, código, caja o colaborador…" value="${escapeHtml(STATE.expiryQuery)}"></div><select class="select" id="expiry-range"><option value="all">Todas las fechas</option><option value="expired" ${STATE.expiryRange==='expired'?'selected':''}>Vencidos</option><option value="30" ${STATE.expiryRange==='30'?'selected':''}>0–30 días</option><option value="60" ${STATE.expiryRange==='60'?'selected':''}>31–60 días</option><option value="90" ${STATE.expiryRange==='90'?'selected':''}>61–90 días</option></select></div><div id="expiry-table">${expiryTable(filtered)}</div></section>`}
 function expiryTable(rows){return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Posición</th><th class="right">Cantidad</th><th>Caducidad</th><th>Estado</th><th>Colaborador</th><th class="right">Acciones</th></tr></thead><tbody>${rows.slice(0,120).map(c=>{let days=daysTo(c.expiry),cls=days<0?'missing':days<=30?'extra':'ok';return `<tr><td><div class="product-name" title="${escapeHtml(c.product?.name||'Producto no encontrado')}">${escapeHtml(c.product?.name||'Producto no encontrado')}</div><span class="product-code">${escapeHtml(c.product?.code||'—')}</span></td><td>${escapeHtml(c.position||'—')}</td><td class="right bold">${nfmt(c.qty)}</td><td>${formatDate(c.expiry)}</td><td><span class="state ${cls}">${days<0?'Vencido':days===0?'Vence hoy':days+' días'}</span></td><td>${escapeHtml(c.name)}</td><td class="right"><button class="btn btn-outline btn-icon" title="Editar registro" data-action="${c.isSurplus?'edit-surplus':'edit-count'}" data-id="${c.id}">${I('edit')}</button> <button class="btn btn-danger btn-icon" title="Borrar registro" data-action="${c.isSurplus?'delete-surplus':'delete-count'}" data-id="${c.id}">${I('trash')}</button></td></tr>`}).join('')||`<tr><td class="empty" colspan="7">Sin registros para este filtro.</td></tr>`}</tbody></table></div>${rows.length>120?`<p class="small muted" style="margin-top:12px">Se muestran los primeros 120 registros. Utiliza el buscador o exporta el reporte completo.</p>`:''}`}
 function usersMarkup(){let arr=STORE.profiles.filter(p=>p.role==='supervisor');return `${header('Usuarios y accesos','Administra los accesos administrativos desde la propia página.',`<button class="btn btn-primary" data-action="new-admin">${I('plus')} Crear supervisor</button>`)}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Supervisores</h3></div><span class="pill">${arr.length} usuarios</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Nombre</th><th>Usuario</th><th>Estado</th><th class="right">Acciones</th></tr></thead><tbody>${arr.length?arr.map(p=>`<tr><td><div style="display:flex;align-items:center;gap:9px">${avatar(p.displayName)}<strong>${escapeHtml(p.displayName||p.username)}</strong></div></td><td>${escapeHtml(p.username)}</td><td><span class="state ${p.active===false?'missing':'ok'}">${p.active===false?'Inactivo':'Activo'}</span></td><td><div class="actions-cell"><button class="btn btn-outline btn-sm" data-action="change-pass" data-id="${p.id}" title="Cambiar contraseña">${I('lock')} Contraseña</button><button class="btn ${p.active===false?'btn-soft':'btn-danger'} btn-sm" data-action="toggle-user" data-id="${p.id}" ${p.id===STORE.uid?'disabled':''}>${p.active===false?'Activar':'Desactivar'}</button></div></td></tr>`).join(''):`<tr><td class="empty" colspan="4">Todavía no se crearon supervisores.</td></tr>`}</tbody></table></div></section><section class="surface pad reset-section" style="margin-top:18px"><div class="surface-head"><div><h3 class="surface-title">Reiniciar inventario</h3></div><span class="pill red">Zona de mantenimiento</span></div><p class="small muted" style="margin:0 0 16px">Elimina las pruebas guardadas en Firebase. Los usuarios de Supervisión se conservan.</p><div class="reset-actions"><button class="btn btn-outline" data-action="reset-modal" data-mode="counts">${I('trash')} Borrar conteos</button><button class="btn btn-outline" data-action="reset-modal" data-mode="catalog">${I('inventory')} Borrar inventario actual</button><button class="btn btn-danger" data-action="reset-modal" data-mode="all">${I('alert')} Reiniciar todo</button></div><p class="small muted" style="margin-top:12px">Estas acciones son irreversibles. Exporta tus datos primero si deseas conservarlos.</p></section>`}
-function workerMarkup(){let allowedIds=new Set(STORE.products.map(p=>p.id)),progressLoaded=STORE.appMode==='demo'||STORE.progressReady,global=new Set([...STORE.markers.map(x=>x.skuId),...STORE.surplus.map(x=>x.linkedSkuId).filter(Boolean)].filter(id=>allowedIds.has(id))).size,total=STORE.products.length,progress=total?100*global/total:0,my=STORE.counts.filter(x=>x.uid===STORE.uid),qty=my.reduce((a,x)=>a+Number(x.qty),0);return `<div class="worker-shell"><header class="worker-header">${logo()}<div style="display:flex;align-items:center;gap:8px">${badgeConnection()}<button class="btn btn-outline btn-icon" title="Salir" data-action="logout">${I('exit')}</button></div></header><div class="worker-welcome"><span style="font-size:11px;letter-spacing:1.2px;opacity:.84;font-weight:800">CONTEO FÍSICO · PUNTOFARMA</span><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0">¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><button type="button" class="btn btn-outline btn-sm" style="color:#fff;border-color:rgba(255,255,255,.55);background:rgba(255,255,255,.12);flex-shrink:0" data-action="sync-progress" title="Comprobar avance general">${I('refresh')} Actualizar</button></div><div class="worker-metrics"><div><small>SKU contados</small><strong>${progressLoaded?nfmt(global):'…'}</strong></div><div><small>SKU pendientes</small><strong>${progressLoaded?nfmt(Math.max(0,total-global)):'…'}</strong></div><div><small>Mis registros</small><strong>${nfmt(my.length)}</strong></div></div><div class="worker-progress"><div style="width:${progress}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:7px;font-size:11px"><span>Avance general</span><b>${progressLoaded?pct(progress):'Actualizando…'}</b></div></div><div class="worker-cols">${workerFormMarkup()}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Mis registros</h3></div><span class="pill">${nfmt(qty)} und.</span></div><div class="my-counts">${my.length?my.slice().sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt))).slice(0,35).map(c=>{let p=STORE.products.find(x=>x.id===c.skuId);return `<div class="my-count-row">${I('check','status-green')}<div class="text"><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · Posición ${escapeHtml(c.position)} · ${formatDate(c.expiry)}</small><div style="display:flex;gap:6px;margin-top:9px"><button class="btn btn-outline btn-sm" data-action="edit-count" data-id="${c.id}">${I('edit')} Editar</button><button class="btn btn-danger btn-sm" data-action="delete-count" data-id="${c.id}">${I('trash')} Borrar</button></div></div><div class="amount">${nfmt(c.qty)}</div></div>`}).join(''):`<div class="empty" style="padding-top:32px">${I('inventory')}<p style="margin-top:8px">Aquí aparecerán tus productos registrados.</p></div>`}${mySurplusMarkup()}</div></section></div></div>`}
+function workerMarkup(){let allowedIds=new Set(STORE.products.map(p=>p.id)),global=new Set([...STORE.markers.map(x=>x.skuId),...STORE.surplus.map(x=>x.linkedSkuId).filter(Boolean)].filter(id=>allowedIds.has(id))).size,total=STORE.products.length,progress=total?100*global/total:0,my=STORE.counts.filter(x=>x.uid===STORE.uid),qty=my.reduce((a,x)=>a+Number(x.qty),0);return `<div class="worker-shell"><header class="worker-header">${logo()}<div style="display:flex;align-items:center;gap:8px">${badgeConnection()}<button class="btn btn-outline btn-icon" title="Salir" data-action="logout">${I('exit')}</button></div></header><div class="worker-welcome"><span style="font-size:11px;letter-spacing:1.2px;opacity:.84;font-weight:800">CONTEO FÍSICO · PUNTOFARMA</span><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0">¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><button type="button" class="btn btn-outline btn-sm" style="color:#fff;border-color:rgba(255,255,255,.55);background:rgba(255,255,255,.12);flex-shrink:0" data-action="sync-progress" title="Comprobar avance general">${I('refresh')} Actualizar</button></div><div class="worker-metrics"><div><small>SKU contados</small><strong>${nfmt(global)}</strong></div><div><small>SKU pendientes</small><strong>${nfmt(Math.max(0,total-global))}</strong></div><div><small>Mis registros</small><strong>${nfmt(my.length)}</strong></div></div><div class="worker-progress"><div style="width:${progress}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:7px;font-size:11px"><span>Avance general</span><b>${pct(progress)}</b></div></div><div class="worker-cols">${workerFormMarkup()}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Mis registros</h3></div><span class="pill">${nfmt(qty)} und.</span></div><div class="my-counts">${my.length?my.slice().sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt))).slice(0,35).map(c=>{let p=STORE.products.find(x=>x.id===c.skuId);return `<div class="my-count-row">${I('check','status-green')}<div class="text"><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · Posición ${escapeHtml(c.position)} · ${formatDate(c.expiry)}</small><div style="display:flex;gap:6px;margin-top:9px"><button class="btn btn-outline btn-sm" data-action="edit-count" data-id="${c.id}">${I('edit')} Editar</button><button class="btn btn-danger btn-sm" data-action="delete-count" data-id="${c.id}">${I('trash')} Borrar</button></div></div><div class="amount">${nfmt(c.qty)}</div></div>`}).join(''):`<div class="empty" style="padding-top:32px">${I('inventory')}<p style="margin-top:8px">Aquí aparecerán tus productos registrados.</p></div>`}${mySurplusMarkup()}</div></section></div></div>`}
 function searchSuggestions(){const q=STATE.workerQuery.trim();if(!q||STATE.selected)return'';let found=STORE.products.filter(p=>matches(p,q)).slice(0,7);return `<div class="suggestions">${found.length?found.map(p=>`<button type="button" class="suggestion" data-action="pick-product" data-id="${p.id}"><strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.code)} · ${escapeHtml(p.presentation||p.category||'Sin categoría')}</small></button>`).join(''):`<div class="empty">Sin coincidencias. Consulta al supervisor si el producto no está en el catálogo.</div>`}</div>`}
 function selectedMarkup(){let p=STORE.products.find(x=>x.id===STATE.selected);return p?`<div class="selected-prod"><div>${I('check','status-green')} <strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.code)} · ${escapeHtml(p.presentation||'')}</small></div><button class="btn btn-outline btn-icon" type="button" data-action="clear-product" title="Cambiar producto">${I('close')}</button></div>`:''}
 function updateSuggestions(){let x=document.getElementById('suggestions'),p=document.getElementById('selected-product');if(x)x.innerHTML=searchSuggestions();if(p)p.innerHTML=selectedMarkup();updateUnitControls()}
@@ -1183,7 +1124,7 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    await navigator.clipboard.writeText(data);notify(`${rows.length} filas copiadas.`);
  }else if(action==='download-filter'){
    exportCsv(filteredRowsCSV(),`puntofarma_${STATE.status}_${localToday()}.csv`);
- }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;if(STORE.appMode==='firebase'&&STORE.role==='supervisor'&&refreshSupervisorFeeds)refreshSupervisorFeeds(STATE.panel);render()}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
+ }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;render()}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
  else if(action==='review-units'){showUnitReview(id)}else if(action==='keep-theory'){const p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto no encontrado.');if(!confirm('¿Confirmas que el teórico actual está expresado en unidades y NO debe multiplicarse? Se mantendrá la diferencia física.'))return;await adapter.updateProduct(id,{unitReviewResolved:true});closeModal();notify('Confirmado: teórico conservado como unidades.');if(STORE.appMode==='demo')render()}else if(action==='edit-product'){showProductEditor(id)}else if(action==='new-product'){showProductEditor(null)}else if(action==='delete-product'){let p=STORE.products.find(x=>x.id===id);if(!confirm(`¿Eliminar ${p?.name||'este producto'} del catálogo?`))return;await adapter.deleteProduct(id);notify('Producto eliminado.');if(STORE.appMode==='demo')render()}
  else if(action==='update-theory'){invoiceUpdateModal()}else if(action==='reconcile-existing-surplus'){INVOICE_REVIEW={items:[],applied:true,links:[]};invoiceReconcileModal()}else if(action==='invoice-suggested'){invoiceBulkSuggested()}else if(action==='invoice-assume-units'){invoiceBulkSingle()}else if(action==='invoice-backup'){invoiceBackup()}else if(action==='invoice-preview-export'){invoiceExportPreview()}else if(action==='invoice-link-review'){invoiceRenderLinks()}else if(action==='invoice-link-toggle'){invoiceToggleLink(id,b.checked)}else if(action==='invoice-link-all'){invoiceSelectSafeLinks()}else if(action==='invoice-link-none'){invoiceClearLinks()}else if(action==='invoice-manual-link'){invoiceManualLinkModal(id)}else if(action==='invoice-previous'){INVOICE_REVIEW.current=Math.max(0,INVOICE_REVIEW.current-1);invoiceRenderReview()}else if(action==='invoice-next'){INVOICE_REVIEW.current++;invoiceRenderReview()}else if(action==='import-modal'){importModal()}else if(action==='reset-modal'){resetModal(b.dataset.mode)}else if(action==='new-admin'){modalNewAdmin()}else if(action==='change-pass'){modalPassword(id)}else if(action==='toggle-user'){if(!confirm('¿Cambiar el estado de este acceso?'))return;await adapter.toggleUser(id);notify('Estado actualizado.');if(STORE.appMode==='demo')render()}
  else if(action==='export-surplus'){exportCsv(surplusCSV(),'puntofarma_sobrantes_manuales.csv')}else if(action==='export-counts'){exportCsv(countCSV(),'puntofarma_conteos.csv')}else if(action==='export-expiry'){exportCsv([...STORE.counts.map(c=>{const p=STORE.products.find(x=>x.id===c.skuId);return {codigo:p?.code||'',producto:p?.name||'',colaborador:c.name,posicion:c.position,cantidad:c.qty,caducidad:formatDate(c.expiry),registro:c.createdAt||'',origen:'Conteo físico'}}).filter(x=>x.caducidad),...surplusCSV()],'puntofarma_caducidades.csv')}else if(action==='export-inventory'){exportCsv(STORE.products.map(p=>({codigo:p.code,producto:p.name,categoria:p.category,presentacion:p.presentation,teorico:p.theoretical,costoTotal:p.costTotal})),'puntofarma_inventario.csv')}
