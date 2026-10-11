@@ -236,11 +236,17 @@ const daysTo=s=>{let [y,m,d]=String(s).slice(0,10).split('-').map(Number);const 
 const validDate=s=>{if(!/^\d{4}-\d{2}-\d{2}$/.test(s))return false;const [y,m,d]=s.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d));return x.getUTCFullYear()===y&&x.getUTCMonth()+1===m&&x.getUTCDate()===d};
 const strId=()=>('PF-'+(crypto?.randomUUID?.()||Math.random().toString(36).slice(2)));
 const debounce=(fn,t=150)=>{let tm;return(...a)=>{clearTimeout(tm);tm=setTimeout(()=>fn(...a),t)}};
+// Ahorro Firestore: señales ligeras para el catálogo y caché del avance en celulares.
+const SYNC_DOC='__pf_catalog_version__';
+const CACHE_NS='PF_FIRESTORE_CACHE_'+String(window.PF_FIREBASE_CONFIG?.projectId||'local')+'_';
+const CACHE_MAX_AGE_MS=8*60*60*1000;
+function readCache(key){try{return JSON.parse(localStorage.getItem(CACHE_NS+key)||'null')}catch{return null}}
+function writeCache(key,value){try{localStorage.setItem(CACHE_NS+key,JSON.stringify(value))}catch(e){console.warn('Caché local no disponible',e)}}
 const sheetNames={dashboard:'Control de inventario',inventory:'Mi inventario',expiry:'Caducidades',users:'Configuración'};
 const navIcons={dashboard:'dashboard',inventory:'inventory',expiry:'calendar',users:'users'};
 const STORE={products:[],counts:[],surplus:[],markers:[],recounts:[],recountEntries:[],profiles:[],appMode:'demo',user:null,uid:null,role:null,connected:false,ready:false};
 const STATE={screen:'access',loginType:'',panel:'dashboard',collapsed:localStorage.getItem(PREFIX+'collapsed')==='true',query:'',status:'all',invQuery:'',expiryQuery:'',expiryRange:'all',page:0,invPage:0,selected:null,workerQuery:'',workerTab:'count',workerName:'',busy:false,editCountId:null,recountSelection:new Set(),recountActiveId:null,recountQuery:''};
-let adapter=null, unsub=[], toastTimer;
+let adapter=null, unsub=[], toastTimer, refreshMarkerProgress=null;
 let INVOICE_REVIEW=null;
 const app=document.getElementById('app');
 const clone=v=>JSON.parse(JSON.stringify(v));
@@ -286,7 +292,11 @@ let fb=null;
 async function initFirebase(){const cfg=window.PF_FIREBASE_CONFIG;if(!cfg||!cfg.apiKey||!cfg.projectId)return false;
  try{
  const [appm,authm,fsm]=await Promise.all([import('https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js'),import('https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js'),import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js')]);
- const project=appm.initializeApp(cfg);fb={cfg,appm,authm,fsm,project,auth:authm.getAuth(project),db:fsm.getFirestore(project)};STORE.appMode='firebase';STORE.connected=false;adapter=firebaseAdapter;return true;
+ const project=appm.initializeApp(cfg);
+ let db;
+ try { db=fsm.initializeFirestore(project,{localCache:fsm.persistentLocalCache({tabManager:fsm.persistentMultipleTabManager()})}); }
+ catch(cacheErr){ console.warn('Persistencia IndexedDB no disponible; continuando con memoria',cacheErr); db=fsm.getFirestore(project); }
+ fb={cfg,appm,authm,fsm,project,auth:authm.getAuth(project),db};STORE.appMode='firebase';STORE.connected=false;adapter=firebaseAdapter;return true;
  }catch(e){console.error(e);document.getElementById('app').innerHTML=`<main class="boot"><h2>No se pudo conectar a Firebase</h2><p>${escapeHtml(e.message)}</p><button class="btn btn-primary" onclick="location.reload()">Reintentar</button></main>`;return 'error'}
 }
 function firestoreProfile(r){return {...r,id:r.id||r.uid}}
@@ -341,8 +351,8 @@ const firebaseAdapter={
  async deleteSurplus(id){await fb.fsm.deleteDoc(fb.fsm.doc(fb.db,'surplus',id))},
  async linkSurplus(items){const {fsm,db}=fb;for(let i=0;i<items.length;i+=150){const b=fsm.writeBatch(db);for(const a of items.slice(i,i+150)){b.update(fsm.doc(db,'surplus',a.id),{linkedSkuId:a.skuId,linkedAt:now(),linkedBy:STORE.uid})}await b.commit()}},
  async editCount(id,data){await fb.fsm.updateDoc(fb.fsm.doc(fb.db,'counts',id),{...data,updatedAt:now()})},
- async deleteCount(id){const b=fb.fsm.writeBatch(fb.db);b.delete(fb.fsm.doc(fb.db,'counts',id));b.delete(fb.fsm.doc(fb.db,'markers',id));await b.commit()},
- async upsertProducts(ps){const {db,fsm}=fb;for(let i=0;i<ps.length;i+=200){let b=fsm.writeBatch(db);for(let p of ps.slice(i,i+200)){b.set(fsm.doc(db,'catalog',p.id),publicProduct(p));const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);b.set(fsm.doc(db,'stock',id),{...stock});}await b.commit()}},
+ async deleteCount(id){const b=fb.fsm.writeBatch(fb.db);b.delete(fb.fsm.doc(fb.db,'counts',id));b.delete(fb.fsm.doc(fb.db,'markers',id));await b.commit();if(STORE.role==='operator'&&refreshMarkerProgress)await refreshMarkerProgress().catch(e=>console.warn('Avance pendiente de actualizar',e))},
+ async upsertProducts(ps){const {db,fsm}=fb;if(!ps.length)return;for(let i=0;i<ps.length;i+=200){let b=fsm.writeBatch(db);for(let p of ps.slice(i,i+200)){b.set(fsm.doc(db,'catalog',p.id),publicProduct(p));const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);b.set(fsm.doc(db,'stock',id),{...stock});}if(i+200>=ps.length)b.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:ps.length<=12?'upsert':'full',ids:ps.length<=12?ps.map(p=>p.id):[]});await b.commit()}},
  async applyTheoryUpdate(ps,onProgress){
    const {db,fsm}=fb;
    if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected)throw Error('Se requiere supervisión con Firebase conectado.');
@@ -363,11 +373,12 @@ const firebaseAdapter={
        const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);
        batch.set(fsm.doc(db,'stock',id),stock);
      }
+     if(i+125>=ps.length)batch.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:'full',ids:[]});
      await batch.commit();finished+=Math.min(125,ps.length-i);onProgress?.(finished,ps.length);
    }
  },
  async updateProduct(id,updates){const p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto inexistente.');await firebaseAdapter.upsertProducts([{...p,...updates}])},
- async deleteProduct(id){if(STORE.counts.some(c=>c.skuId===id))throw Error('Producto con conteos: no se puede borrar.');const {fsm,db}=fb;let b=fsm.writeBatch(db);b.delete(fsm.doc(db,'catalog',id));b.delete(fsm.doc(db,'stock',id));await b.commit()},
+ async deleteProduct(id){if(STORE.counts.some(c=>c.skuId===id))throw Error('Producto con conteos: no se puede borrar.');const {fsm,db}=fb;let b=fsm.writeBatch(db);b.delete(fsm.doc(db,'catalog',id));b.delete(fsm.doc(db,'stock',id));b.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:'delete',ids:[id]});await b.commit()},
  async queueRecounts(tasks){const {fsm,db}=fb;let created=0;for(const t of tasks){const ref=fsm.doc(db,'recounts',t.skuId);const inserted=await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(snap.exists())return false;tx.set(ref,t);return true});if(inserted)created++}if(!created)throw Error('Los códigos seleccionados ya estaban enviados.')},
  async claimRecount(skuId){const {fsm,db}=fb,ref=fsm.doc(db,'recounts',skuId);await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(!snap.exists()||snap.data().status!=='pending')throw Error('Otro colaborador ya tomó ese código. Actualiza la lista.');tx.update(ref,{status:'in_progress',assignedUid:STORE.uid,assignedName:STORE.user.displayName,attemptId:strId(),claimedAt:now(),updatedAt:now()})})},
  async releaseRecount(skuId){const {fsm,db}=fb,ref=fsm.doc(db,'recounts',skuId);await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(!snap.exists()||snap.data().status!=='in_progress')throw Error('El reconteo ya no está activo.');if(STORE.role!=='supervisor'&&snap.data().assignedUid!==STORE.uid)throw Error('No tienes permiso para liberar este código.');tx.update(ref,{status:'pending',assignedUid:'',assignedName:'',attemptId:'',claimedAt:'',updatedAt:now()})})},
@@ -410,16 +421,17 @@ const firebaseAdapter={
  },
  async start(role,uid){
   const {fsm,db}=fb;
-  unsub.forEach(f=>f());unsub=[];
+  unsub.forEach(f=>f());unsub=[];refreshMarkerProgress=null;
   STORE.products=[];STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.recounts=[];STORE.recountEntries=[];STORE.profiles=[];
   STORE.ready=false;STORE.connected=false;STORE.syncIssue=null;
-  const stockCache=new Map(), received=new Set(), reported=new Set();
-  // Solo los datos indispensables deben bloquear el conteo. Las colecciones nuevas
-  // (sobrantes y reconteos) pueden requerir reglas actualizadas; no paralizan inventarios.
-  const required=role==='supervisor'?['catalog','stock','counts','markers']:
+  const received=new Set(),reported=new Set();
+  // Los catálogos y el stock cambian poco: ya NO dejamos escuchas en vivo de
+  // cientos de documentos. Una señal de un documento anuncia cuándo refrescar.
+  const required=role==='supervisor'?['catalog','stock','counts']:
                  role==='recount'?['catalog','recounts']:
                  ['catalog','counts','markers'];
-  let syncTimer=null, sessionStopped=false;
+  let syncTimer=null, sessionStopped=false, lastCatalogVersion=null, catalogVersionSeen=false;
+  let refreshingCatalog=Promise.resolve(), refreshBusy=false;
   const friendly=(key,e)=>{
     const raw=String(e?.message||e||'Error de conexión');
     const desc=key==='stock'?'existencias teóricas':key==='catalog'?'catálogo':
@@ -460,12 +472,8 @@ const firebaseAdapter={
         if(sessionStopped)return;
         console.error('PuntoFarma Firebase / '+key,e);
         const message=friendly(key,e);
-        if(required.includes(key)){
-          setFailure(message);
-        }else if(!reported.has(key)){
-          reported.add(key);
-          notify('Módulo no disponible: '+message,'error');
-        }
+        if(required.includes(key))setFailure(message);
+        else if(!reported.has(key)){reported.add(key);notify('Módulo no disponible: '+message,'error')}
       });
       unsub.push(()=>{sessionStopped=true;clearTimeout(syncTimer);stop()});
     }catch(e){
@@ -474,23 +482,144 @@ const firebaseAdapter={
       else notify(friendly(key,e),'error');
     }
   };
-  watch('catalog',fsm.collection(db,'catalog'),rows=>{
-    STORE.products=rows.map(p=>role==='supervisor'?{...p,...(stockCache.get(p.id)||{})}:publicProduct(p));
-  });
-  watch('markers',fsm.collection(db,'markers'),a=>STORE.markers=a);
-  watch('recounts',fsm.collection(db,'recounts'),a=>STORE.recounts=a);
-  watch('recount_entries',role==='supervisor'?fsm.collection(db,'recount_entries'):fsm.query(fsm.collection(db,'recount_entries'),fsm.where('uid','==',uid)),a=>STORE.recountEntries=a);
-  watch('surplus',role==='supervisor'?fsm.collection(db,'surplus'):fsm.query(fsm.collection(db,'surplus'),fsm.where('uid','==',uid)),a=>STORE.surplus=a);
-  watch('counts',role==='supervisor'?fsm.collection(db,'counts'):fsm.query(fsm.collection(db,'counts'),fsm.where('uid','==',uid)),a=>STORE.counts=a);
-  if(role==='supervisor'){
-    watch('stock',fsm.collection(db,'stock'),rows=>{
-      stockCache.clear();rows.forEach(p=>stockCache.set(p.id,p));
-      STORE.products=STORE.products.map(p=>({...p,...(stockCache.get(p.id)||{})}));
+  // CATÁLOGO: lectura única inicial o caché verificada por versión.
+  // Cada modificación hecha desde Mi inventario actualiza SYNC_DOC, evitando
+  // descargas reiteradas de los ~700 productos en cada conexión del celular.
+  const loadCatalog=async(version,force)=>{
+    const cache=role==='supervisor'?null:readCache('catalog');
+    if(!force && cache && cache.version===version && Array.isArray(cache.products)){
+      STORE.products=cache.products.map(publicProduct);
+      received.add('catalog');updateReady();
+      return;
+    }
+    const snapshot=await fsm.getDocs(fsm.collection(db,'catalog'));
+    if(sessionStopped)return;
+    const rows=snapshot.docs.filter(d=>d.id!==SYNC_DOC).map(d=>({id:d.id,...d.data()}));
+    STORE.products=role==='supervisor'?rows:rows.map(publicProduct);
+    if(role!=='supervisor')writeCache('catalog',{version,products:STORE.products,at:Date.now()});
+    received.add('catalog');updateReady();
+  };
+  const refreshCatalog=async(version,force=false)=>{
+    refreshingCatalog=refreshingCatalog.catch(()=>{}).then(async()=>{
+      if(sessionStopped)return;
+      await loadCatalog(version,force);
+      if(role==='supervisor'){
+        const snap=await fsm.getDocs(fsm.collection(db,'stock'));
+        if(sessionStopped)return;
+        const stock=new Map(snap.docs.map(d=>[d.id,d.data()]));
+        STORE.products=STORE.products.map(p=>({...p,...(stock.get(p.id)||{})}));
+        received.add('stock');updateReady();
+      }
+    }).catch(e=>{
+      console.error('PuntoFarma Firebase / catálogo',e);
+      if(!STORE.ready)setFailure(friendly('catalog',e));
+      else if(!sessionStopped)notify('No se pudo actualizar el catálogo: '+String(e.message||e),'error');
     });
+    return refreshingCatalog;
+  };
+  // Ediciones pequeñas: descargar solo los SKU modificados, no todo el catálogo.
+  const refreshCatalogDelta=(version,signal)=>{
+    const ids=Array.isArray(signal?.ids)?signal.ids:[];
+    if(!received.has('catalog')||!ids.length||ids.length>12||!['upsert','delete'].includes(signal?.action)){
+      return refreshCatalog(version,true);
+    }
+    refreshingCatalog=refreshingCatalog.catch(()=>{}).then(async()=>{
+      if(sessionStopped)return;
+      const byId=new Map(STORE.products.map(p=>[p.id,p]));
+      for(const id of ids){
+        if(signal.action==='delete'){byId.delete(id);continue}
+        const docSnap=await fsm.getDoc(fsm.doc(db,'catalog',id));
+        if(sessionStopped)return;
+        if(!docSnap.exists()){byId.delete(id);continue}
+        const product={id,...docSnap.data()};
+        if(role==='supervisor'){
+          const stockSnap=await fsm.getDoc(fsm.doc(db,'stock',id));
+          byId.set(id,{...product,...(stockSnap.exists()?stockSnap.data():{})});
+        }else byId.set(id,publicProduct(product));
+      }
+      if(sessionStopped)return;
+      STORE.products=[...byId.values()];
+      if(role!=='supervisor')writeCache('catalog',{version,products:STORE.products,at:Date.now()});
+      scheduleRender();
+    }).catch(e=>{
+      console.error('PuntoFarma Firebase / cambio catálogo',e);
+      if(!sessionStopped)notify('No se pudo descargar un cambio de catálogo: '+String(e.message||e),'error');
+      // Siguiente apertura hará comparación de versiones y carga completa.
+    });
+    return refreshingCatalog;
+  };
+  // Se mantiene una sola escucha de 1 documento, no de todos los productos.
+  try{
+    const stop=fsm.onSnapshot(fsm.doc(db,'catalog',SYNC_DOC),snap=>{
+      if(sessionStopped)return;
+      const data=snap.exists()?snap.data():{};
+      const version=snap.exists()?String(data.version||'legacy'):'legacy';
+      if(!catalogVersionSeen){catalogVersionSeen=true;lastCatalogVersion=version;refreshCatalog(version)}
+      else if(version!==lastCatalogVersion){lastCatalogVersion=version;refreshCatalogDelta(version,data)}
+    },e=>{if(!sessionStopped)setFailure(friendly('catalog',e))});
+    unsub.push(()=>{sessionStopped=true;clearTimeout(syncTimer);stop()});
+  }catch(e){setFailure(friendly('catalog',e))}
+
+  // CONTEO EN VIVO: se mantiene la escucha completa únicamente de los conteos
+  // del propio usuario, o de todos para Supervisión (ERI y diferencias exactos).
+  if(role!=='recount'){
+    watch('counts',role==='supervisor'?fsm.collection(db,'counts'):
+      fsm.query(fsm.collection(db,'counts'),fsm.where('uid','==',uid)),a=>{
+       STORE.counts=a;
+       if(role==='supervisor')STORE.markers=a.map(c=>({id:c.id,skuId:c.skuId,uid:c.uid,createdAt:c.createdAt}));
+    });
+  }
+  // El supervisor deduce el avance de counts; no necesita leer otra vez markers.
+  // El colaborador utiliza caché del avance + una escucha limitada a los últimos 80.
+  if(role==='operator'){
+    let markerMap=new Map(),markerCache=readCache('markers'),fullAt=Number(markerCache?.fullAt||0);
+    const persistMarkers=debounce(()=>writeCache('markers',{fullAt,rows:[...markerMap.values()]}),2000);
+    if(markerCache && Array.isArray(markerCache.rows) && Date.now()-fullAt<CACHE_MAX_AGE_MS){
+      markerMap=new Map(markerCache.rows.map(m=>[m.id,m]));
+      STORE.markers=[...markerMap.values()];
+      received.add('markers');updateReady();
+    }else{
+      const fetchStarted=now();
+      fsm.getDocs(fsm.collection(db,'markers')).then(snap=>{
+        if(sessionStopped)return;
+        // Refresco completo para quitar marcas antiguas eliminadas; preservar
+        // solamente altas que se recibieron mientras se hacía la consulta.
+        const recent=[...markerMap.values()].filter(m=>String(m.createdAt||'')>=fetchStarted);
+        markerMap=new Map(snap.docs.map(d=>[d.id,{id:d.id,...d.data()}]));
+        for(const m of recent)markerMap.set(m.id,m);
+        fullAt=Date.now();
+        STORE.markers=[...markerMap.values()];received.add('markers');
+        persistMarkers();updateReady();
+      }).catch(e=>{if(!sessionStopped)setFailure(friendly('markers',e))});
+    }
+    // Ante un borrado del propio colaborador, verificar inmediatamente el avance:
+    // no permitir que una marca vieja siga figurando como contada en la caché.
+    refreshMarkerProgress=async()=>{
+      const snap=await fsm.getDocs(fsm.collection(db,'markers'));
+      if(sessionStopped)return;
+      markerMap=new Map(snap.docs.map(d=>[d.id,{id:d.id,...d.data()}]));
+      fullAt=Date.now();STORE.markers=[...markerMap.values()];
+      writeCache('markers',{fullAt,rows:STORE.markers});
+      scheduleRender();
+    };
+    watch('markers_recent',fsm.query(fsm.collection(db,'markers'),fsm.orderBy('createdAt','desc'),fsm.limit(80)),rows=>{
+      rows.forEach(m=>markerMap.set(m.id,m));
+      STORE.markers=[...markerMap.values()];persistMarkers();
+    });
+  }
+  if(role==='supervisor'){
     watch('profiles',fsm.collection(db,'profiles'),a=>STORE.profiles=a);
+    watch('surplus',fsm.collection(db,'surplus'),a=>STORE.surplus=a);
+    watch('recounts',fsm.collection(db,'recounts'),a=>STORE.recounts=a);
+    watch('recount_entries',fsm.collection(db,'recount_entries'),a=>STORE.recountEntries=a);
+  }else if(role==='operator'){
+    watch('surplus',fsm.query(fsm.collection(db,'surplus'),fsm.where('uid','==',uid)),a=>STORE.surplus=a);
+  }else if(role==='recount'){
+    watch('recounts',fsm.collection(db,'recounts'),a=>STORE.recounts=a);
+    watch('recount_entries',fsm.query(fsm.collection(db,'recount_entries'),fsm.where('uid','==',uid)),a=>STORE.recountEntries=a);
   }
  },
- async signOut(){unsub.forEach(f=>f());unsub=[];await fb.authm.signOut(fb.auth)}
+ async signOut(){unsub.forEach(f=>f());unsub=[];refreshMarkerProgress=null;await fb.authm.signOut(fb.auth)}
 };
 function loginEmail(u){
   if(!/^[a-z0-9._-]{3,32}$/i.test(u.trim()))throw Error('Usuario: utiliza de 3 a 32 caracteres válidos.');
@@ -696,14 +825,14 @@ function recountMarkup(){
  const active=tasks.find(x=>x.skuId===STATE.recountActiveId&&x.status==='in_progress'&&x.assignedUid===STORE.uid)||mine[0]||null;
  const ownEntries=active?STORE.recountEntries.filter(x=>x.skuId===active.skuId&&x.uid===STORE.uid&&x.attemptId===active.attemptId):[];
  const queue=`<section class="surface pad" id="recount-queue"><div class="surface-head"><h3 class="surface-title">Códigos disponibles</h3><span class="pill green">${pending.length} pendientes</span></div><p class="small muted" style="margin-bottom:12px">Al seleccionar un código, se reservará para ti y desaparecerá de las listas de otros colaboradores.</p><div class="recount-items">${pending.map(t=>`<div class="recount-item"><div><strong>${escapeHtml(t.name)}</strong><small>${escapeHtml(t.code)} · ${(t.positions||[]).length} posición(es)</small></div><button class="btn btn-primary btn-sm" data-action="claim-recount" data-id="${escapeHtml(t.skuId)}">Tomar</button></div>`).join('')||'<div class="empty">No hay códigos disponibles para reconteo.</div>'}</div></section>`;
- return `<div class="worker-shell recount-shell"><header class="worker-header">${logo()}<div class="chiprow">${badgeConnection()}<button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header><div class="worker-welcome" id="recount-metrics"><span style="font-size:11px;letter-spacing:1px;font-weight:800">RECONTEO DE NOVEDADES</span><h2>¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><div class="worker-metrics"><div><small>Disponibles</small><strong>${pending.length}</strong></div><div><small>En revisión</small><strong>${tasks.filter(t=>t.status==='in_progress').length}</strong></div><div><small>Finalizados</small><strong>${done.length}</strong></div></div></div><div class="recount-cols"><section class="surface pad recount-work"><div class="surface-head"><h3 class="surface-title">${active?'Código reservado':'Mi reconteo'}</h3>${active?'<span class="pill yellow">Asignado a ti</span>':''}</div>${active?`<div class="selected-prod recount-selected-product" style="margin-bottom:15px"><div><strong>${escapeHtml(active.name)}</strong><small>${escapeHtml(active.code)}</small></div><a class="btn btn-outline btn-sm recount-image-link" href="${escapeHtml('https://www.google.com/search?tbm=isch&q='+encodeURIComponent(active.name+' '+active.code))}" target="_blank" rel="noopener noreferrer" title="Buscar imágenes del producto en Google">${I('search')} Ver imagen</a></div><h4 style="margin-bottom:9px">Posiciones registradas anteriormente</h4><div class="chiprow" style="margin-bottom:13px">${(active.positions||[]).map(x=>`<span class="position-chip">${escapeHtml(x)}</span>`).join('')||'<span class="small muted">No se registraron posiciones</span>'}</div><form id="recount-form" data-form="recount-count" class="form-stack"><div class="form-row"><div class="field"><label>Unidades físicas *</label><input class="input" type="number" name="qty" min="1" step="1" inputmode="numeric" required></div><div class="field"><label>Posición *</label><input class="input" name="position" inputmode="numeric" pattern="[0-9]+" placeholder="01" required></div></div><div class="field"><label>Caducidad * (MMAA)</label><input class="input" name="expiry" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" placeholder="0826" required><small>Ejemplo: 0826 = Agosto/2026</small></div><button type="submit" class="btn btn-primary btn-block">${I('check')} Guardar registro</button></form><div class="recount-saved"><h4>Mis registros del reconteo (${ownEntries.length})</h4>${ownEntries.map(e=>`<div class="recount-entry"><span>${e.qty===0?'No encontrado':`Pos. ${escapeHtml(e.position)} · ${formatDate(e.expiry)}`}</span><span><strong>${nfmt(e.qty)} und.</strong> <button class="btn btn-danger btn-icon btn-sm" data-action="delete-recount-entry" data-id="${escapeHtml(e.id)}" title="Eliminar registro">${I('trash')}</button></span></div>`).join('')||'<div class="small muted">Aún no hay registros guardados.</div>'}</div><div class="recount-buttons"><button class="btn btn-lime" data-action="finish-recount" data-id="${escapeHtml(active.skuId)}" ${ownEntries.length?'':'disabled'}>${I('check')} Finalizar reconteo</button><button class="btn btn-outline" data-action="release-recount" data-id="${escapeHtml(active.skuId)}">Liberar código</button>${ownEntries.length?'':`<button class="btn btn-outline" data-action="recount-no-stock" data-id="${escapeHtml(active.skuId)}">No encontré unidades</button>`}</div>`:'<div class="empty">Selecciona un código de la lista para comenzar. No verás cantidades del primer conteo ni stock teórico.</div>'}</section>${queue}</div></div>`;
+ return `<div class="worker-shell recount-shell"><header class="worker-header">${logo()}<div class="chiprow">${badgeConnection()}<button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header><div class="worker-welcome" id="recount-metrics"><span style="font-size:11px;letter-spacing:1px;font-weight:800">RECONTEO DE NOVEDADES</span><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0">¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><button type="button" class="btn btn-outline btn-sm" style="color:#fff;border-color:rgba(255,255,255,.55);background:rgba(255,255,255,.12);flex-shrink:0" data-action="sync-progress" title="Comprobar avance general">${I('refresh')} Actualizar</button></div><div class="worker-metrics"><div><small>Disponibles</small><strong>${pending.length}</strong></div><div><small>En revisión</small><strong>${tasks.filter(t=>t.status==='in_progress').length}</strong></div><div><small>Finalizados</small><strong>${done.length}</strong></div></div></div><div class="recount-cols"><section class="surface pad recount-work"><div class="surface-head"><h3 class="surface-title">${active?'Código reservado':'Mi reconteo'}</h3>${active?'<span class="pill yellow">Asignado a ti</span>':''}</div>${active?`<div class="selected-prod recount-selected-product" style="margin-bottom:15px"><div><strong>${escapeHtml(active.name)}</strong><small>${escapeHtml(active.code)}</small></div><a class="btn btn-outline btn-sm recount-image-link" href="${escapeHtml('https://www.google.com/search?tbm=isch&q='+encodeURIComponent(active.name+' '+active.code))}" target="_blank" rel="noopener noreferrer" title="Buscar imágenes del producto en Google">${I('search')} Ver imagen</a></div><h4 style="margin-bottom:9px">Posiciones registradas anteriormente</h4><div class="chiprow" style="margin-bottom:13px">${(active.positions||[]).map(x=>`<span class="position-chip">${escapeHtml(x)}</span>`).join('')||'<span class="small muted">No se registraron posiciones</span>'}</div><form id="recount-form" data-form="recount-count" class="form-stack"><div class="form-row"><div class="field"><label>Unidades físicas *</label><input class="input" type="number" name="qty" min="1" step="1" inputmode="numeric" required></div><div class="field"><label>Posición *</label><input class="input" name="position" inputmode="numeric" pattern="[0-9]+" placeholder="01" required></div></div><div class="field"><label>Caducidad * (MMAA)</label><input class="input" name="expiry" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" placeholder="0826" required><small>Ejemplo: 0826 = Agosto/2026</small></div><button type="submit" class="btn btn-primary btn-block">${I('check')} Guardar registro</button></form><div class="recount-saved"><h4>Mis registros del reconteo (${ownEntries.length})</h4>${ownEntries.map(e=>`<div class="recount-entry"><span>${e.qty===0?'No encontrado':`Pos. ${escapeHtml(e.position)} · ${formatDate(e.expiry)}`}</span><span><strong>${nfmt(e.qty)} und.</strong> <button class="btn btn-danger btn-icon btn-sm" data-action="delete-recount-entry" data-id="${escapeHtml(e.id)}" title="Eliminar registro">${I('trash')}</button></span></div>`).join('')||'<div class="small muted">Aún no hay registros guardados.</div>'}</div><div class="recount-buttons"><button class="btn btn-lime" data-action="finish-recount" data-id="${escapeHtml(active.skuId)}" ${ownEntries.length?'':'disabled'}>${I('check')} Finalizar reconteo</button><button class="btn btn-outline" data-action="release-recount" data-id="${escapeHtml(active.skuId)}">Liberar código</button>${ownEntries.length?'':`<button class="btn btn-outline" data-action="recount-no-stock" data-id="${escapeHtml(active.skuId)}">No encontré unidades</button>`}</div>`:'<div class="empty">Selecciona un código de la lista para comenzar. No verás cantidades del primer conteo ni stock teórico.</div>'}</section>${queue}</div></div>`;
 }
 function inventoryMarkup(){return `${header('Mi inventario','Administración del catálogo teórico y sus existencias.',`<button class="btn btn-primary" data-action="import-modal">${I('upload')} Carga inicial</button><button class="btn btn-lime" data-action="update-theory">${I('refresh')} Actualizar stock teórico</button><button class="btn btn-outline" data-action="reconcile-existing-surplus">${I('check')} Conciliar fuera de stock</button><button class="btn btn-outline" data-action="new-product">${I('plus')} Nuevo producto</button>`)}<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Referencias',nfmt(STORE.products.length),'inventory')}${kpi('Unidades teóricas',nfmt(STORE.products.reduce((a,p)=>a+(Number(p.theoretical)||0),0)),'database')}${kpi('Costo declarado',money(STORE.products.reduce((a,p)=>a+(Number(p.costTotal)||0),0)),'dashboard')}</div><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Catálogo de productos</h3></div><button class="btn btn-outline btn-sm" data-action="export-inventory">${I('download')} CSV</button></div><div class="search-wrap" style="margin-bottom:13px">${I('search')}<input class="input" id="inventory-search" value="${escapeHtml(STATE.invQuery)}" placeholder="Buscar en todo el inventario…"></div><div id="inventory-table">${inventoryTable()}</div></section>${reviewPresentationMarkup()}`}
 function inventoryTable(){let rows=STORE.products.filter(p=>matches(p,STATE.invQuery));const lim=15,max=Math.max(1,Math.ceil(rows.length/lim));STATE.invPage=Math.max(0,Math.min(STATE.invPage,max-1));return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Categoría</th><th>Presentación</th><th class="right">Teórico</th><th class="right">Costo total</th><th class="right">Acciones</th></tr></thead><tbody>${rows.slice(STATE.invPage*lim,(STATE.invPage+1)*lim).map(p=>`<tr><td><div class="product-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div><span class="product-code">${escapeHtml(p.code)}</span></td><td>${escapeHtml(p.category||'Sin categoría')}</td><td>${escapeHtml(p.presentation||'—')}</td><td class="right bold">${nfmt(p.theoretical)}</td><td class="right">${money(p.costTotal)}</td><td><div class="actions-cell"><button class="btn btn-outline btn-icon" title="Editar" data-action="edit-product" data-id="${p.id}">${I('edit')}</button><button class="btn btn-danger btn-icon" title="Eliminar" data-action="delete-product" data-id="${p.id}">${I('trash')}</button></div></td></tr>`).join('')||`<tr><td colspan="6" class="empty">No hay coincidencias.</td></tr>`}</tbody></table></div>${pagination(rows.length,lim,STATE.invPage,'inv')}`}
 function expiryMarkup(){let c=[...STORE.counts.map(x=>({...x,product:STORE.products.find(p=>p.id===x.skuId)})),...STORE.surplus.map(x=>({...x,isSurplus:true,position:'—',product:{name:x.productName,code:x.code}}))].filter(x=>x.expiry&&validDate(x.expiry));const expir=c.filter(x=>daysTo(x.expiry)<0),d30=c.filter(x=>daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30),d60=c.filter(x=>daysTo(x.expiry)>30&&daysTo(x.expiry)<=60),d90=c.filter(x=>daysTo(x.expiry)>60&&daysTo(x.expiry)<=90);let filtered=c.filter(x=>(STATE.expiryRange==='all'||(STATE.expiryRange==='expired'&&daysTo(x.expiry)<0)||(STATE.expiryRange==='30'&&daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30)||(STATE.expiryRange==='60'&&daysTo(x.expiry)>30&&daysTo(x.expiry)<=60)||(STATE.expiryRange==='90'&&daysTo(x.expiry)>60&&daysTo(x.expiry)<=90))&&matches(x.product||{},STATE.expiryQuery,[x.position,x.expiry,x.name].join(' '))).sort((a,b)=>a.expiry.localeCompare(b.expiry));return `${header('Caducidades','Control de fechas de vencimiento a partir de los conteos físicos registrados.',`<button class="btn btn-outline" data-action="export-expiry">${I('download')} Exportar reporte</button>`)}<div class="kpi-grid">${kpi('Vencidos',nfmt(expir.reduce((a,x)=>a+Number(x.qty),0)),'alert','red',`${expir.length} registros`)}${kpi('Próx. 30 días',nfmt(d30.reduce((a,x)=>a+Number(x.qty),0)),'clock','amber',`${d30.length} registros`)}${kpi('Entre 31 y 60',nfmt(d60.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}${kpi('Entre 61 y 90',nfmt(d90.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}</div><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Vencimientos por caja</h3></div></div><div class="toolbar" style="margin-bottom:13px"><div class="search-wrap">${I('search')}<input class="input" id="expiry-search" placeholder="Buscar producto, código, caja o colaborador…" value="${escapeHtml(STATE.expiryQuery)}"></div><select class="select" id="expiry-range"><option value="all">Todas las fechas</option><option value="expired" ${STATE.expiryRange==='expired'?'selected':''}>Vencidos</option><option value="30" ${STATE.expiryRange==='30'?'selected':''}>0–30 días</option><option value="60" ${STATE.expiryRange==='60'?'selected':''}>31–60 días</option><option value="90" ${STATE.expiryRange==='90'?'selected':''}>61–90 días</option></select></div><div id="expiry-table">${expiryTable(filtered)}</div></section>`}
 function expiryTable(rows){return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Posición</th><th class="right">Cantidad</th><th>Caducidad</th><th>Estado</th><th>Colaborador</th><th class="right">Acciones</th></tr></thead><tbody>${rows.slice(0,120).map(c=>{let days=daysTo(c.expiry),cls=days<0?'missing':days<=30?'extra':'ok';return `<tr><td><div class="product-name" title="${escapeHtml(c.product?.name||'Producto no encontrado')}">${escapeHtml(c.product?.name||'Producto no encontrado')}</div><span class="product-code">${escapeHtml(c.product?.code||'—')}</span></td><td>${escapeHtml(c.position||'—')}</td><td class="right bold">${nfmt(c.qty)}</td><td>${formatDate(c.expiry)}</td><td><span class="state ${cls}">${days<0?'Vencido':days===0?'Vence hoy':days+' días'}</span></td><td>${escapeHtml(c.name)}</td><td class="right"><button class="btn btn-outline btn-icon" title="Editar registro" data-action="${c.isSurplus?'edit-surplus':'edit-count'}" data-id="${c.id}">${I('edit')}</button> <button class="btn btn-danger btn-icon" title="Borrar registro" data-action="${c.isSurplus?'delete-surplus':'delete-count'}" data-id="${c.id}">${I('trash')}</button></td></tr>`}).join('')||`<tr><td class="empty" colspan="7">Sin registros para este filtro.</td></tr>`}</tbody></table></div>${rows.length>120?`<p class="small muted" style="margin-top:12px">Se muestran los primeros 120 registros. Utiliza el buscador o exporta el reporte completo.</p>`:''}`}
 function usersMarkup(){let arr=STORE.profiles.filter(p=>p.role==='supervisor');return `${header('Usuarios y accesos','Administra los accesos administrativos desde la propia página.',`<button class="btn btn-primary" data-action="new-admin">${I('plus')} Crear supervisor</button>`)}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Supervisores</h3></div><span class="pill">${arr.length} usuarios</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Nombre</th><th>Usuario</th><th>Estado</th><th class="right">Acciones</th></tr></thead><tbody>${arr.length?arr.map(p=>`<tr><td><div style="display:flex;align-items:center;gap:9px">${avatar(p.displayName)}<strong>${escapeHtml(p.displayName||p.username)}</strong></div></td><td>${escapeHtml(p.username)}</td><td><span class="state ${p.active===false?'missing':'ok'}">${p.active===false?'Inactivo':'Activo'}</span></td><td><div class="actions-cell"><button class="btn btn-outline btn-sm" data-action="change-pass" data-id="${p.id}" title="Cambiar contraseña">${I('lock')} Contraseña</button><button class="btn ${p.active===false?'btn-soft':'btn-danger'} btn-sm" data-action="toggle-user" data-id="${p.id}" ${p.id===STORE.uid?'disabled':''}>${p.active===false?'Activar':'Desactivar'}</button></div></td></tr>`).join(''):`<tr><td class="empty" colspan="4">Todavía no se crearon supervisores.</td></tr>`}</tbody></table></div></section><section class="surface pad reset-section" style="margin-top:18px"><div class="surface-head"><div><h3 class="surface-title">Reiniciar inventario</h3></div><span class="pill red">Zona de mantenimiento</span></div><p class="small muted" style="margin:0 0 16px">Elimina las pruebas guardadas en Firebase. Los usuarios de Supervisión se conservan.</p><div class="reset-actions"><button class="btn btn-outline" data-action="reset-modal" data-mode="counts">${I('trash')} Borrar conteos</button><button class="btn btn-outline" data-action="reset-modal" data-mode="catalog">${I('inventory')} Borrar inventario actual</button><button class="btn btn-danger" data-action="reset-modal" data-mode="all">${I('alert')} Reiniciar todo</button></div><p class="small muted" style="margin-top:12px">Estas acciones son irreversibles. Exporta tus datos primero si deseas conservarlos.</p></section>`}
-function workerMarkup(){let allowedIds=new Set(STORE.products.map(p=>p.id)),global=new Set([...STORE.markers.map(x=>x.skuId),...STORE.surplus.map(x=>x.linkedSkuId).filter(Boolean)].filter(id=>allowedIds.has(id))).size,total=STORE.products.length,progress=total?100*global/total:0,my=STORE.counts.filter(x=>x.uid===STORE.uid),qty=my.reduce((a,x)=>a+Number(x.qty),0);return `<div class="worker-shell"><header class="worker-header">${logo()}<div style="display:flex;align-items:center;gap:8px">${badgeConnection()}<button class="btn btn-outline btn-icon" title="Salir" data-action="logout">${I('exit')}</button></div></header><div class="worker-welcome"><span style="font-size:11px;letter-spacing:1.2px;opacity:.84;font-weight:800">CONTEO FÍSICO · PUNTOFARMA</span><h2>¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><div class="worker-metrics"><div><small>SKU contados</small><strong>${nfmt(global)}</strong></div><div><small>SKU pendientes</small><strong>${nfmt(Math.max(0,total-global))}</strong></div><div><small>Mis registros</small><strong>${nfmt(my.length)}</strong></div></div><div class="worker-progress"><div style="width:${progress}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:7px;font-size:11px"><span>Avance general</span><b>${pct(progress)}</b></div></div><div class="worker-cols">${workerFormMarkup()}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Mis registros</h3></div><span class="pill">${nfmt(qty)} und.</span></div><div class="my-counts">${my.length?my.slice().sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt))).slice(0,35).map(c=>{let p=STORE.products.find(x=>x.id===c.skuId);return `<div class="my-count-row">${I('check','status-green')}<div class="text"><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · Posición ${escapeHtml(c.position)} · ${formatDate(c.expiry)}</small><div style="display:flex;gap:6px;margin-top:9px"><button class="btn btn-outline btn-sm" data-action="edit-count" data-id="${c.id}">${I('edit')} Editar</button><button class="btn btn-danger btn-sm" data-action="delete-count" data-id="${c.id}">${I('trash')} Borrar</button></div></div><div class="amount">${nfmt(c.qty)}</div></div>`}).join(''):`<div class="empty" style="padding-top:32px">${I('inventory')}<p style="margin-top:8px">Aquí aparecerán tus productos registrados.</p></div>`}${mySurplusMarkup()}</div></section></div></div>`}
+function workerMarkup(){let allowedIds=new Set(STORE.products.map(p=>p.id)),global=new Set([...STORE.markers.map(x=>x.skuId),...STORE.surplus.map(x=>x.linkedSkuId).filter(Boolean)].filter(id=>allowedIds.has(id))).size,total=STORE.products.length,progress=total?100*global/total:0,my=STORE.counts.filter(x=>x.uid===STORE.uid),qty=my.reduce((a,x)=>a+Number(x.qty),0);return `<div class="worker-shell"><header class="worker-header">${logo()}<div style="display:flex;align-items:center;gap:8px">${badgeConnection()}<button class="btn btn-outline btn-icon" title="Salir" data-action="logout">${I('exit')}</button></div></header><div class="worker-welcome"><span style="font-size:11px;letter-spacing:1.2px;opacity:.84;font-weight:800">CONTEO FÍSICO · PUNTOFARMA</span><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0">¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><button type="button" class="btn btn-outline btn-sm" style="color:#fff;border-color:rgba(255,255,255,.55);background:rgba(255,255,255,.12);flex-shrink:0" data-action="sync-progress" title="Comprobar avance general">${I('refresh')} Actualizar</button></div><div class="worker-metrics"><div><small>SKU contados</small><strong>${nfmt(global)}</strong></div><div><small>SKU pendientes</small><strong>${nfmt(Math.max(0,total-global))}</strong></div><div><small>Mis registros</small><strong>${nfmt(my.length)}</strong></div></div><div class="worker-progress"><div style="width:${progress}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:7px;font-size:11px"><span>Avance general</span><b>${pct(progress)}</b></div></div><div class="worker-cols">${workerFormMarkup()}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Mis registros</h3></div><span class="pill">${nfmt(qty)} und.</span></div><div class="my-counts">${my.length?my.slice().sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt))).slice(0,35).map(c=>{let p=STORE.products.find(x=>x.id===c.skuId);return `<div class="my-count-row">${I('check','status-green')}<div class="text"><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · Posición ${escapeHtml(c.position)} · ${formatDate(c.expiry)}</small><div style="display:flex;gap:6px;margin-top:9px"><button class="btn btn-outline btn-sm" data-action="edit-count" data-id="${c.id}">${I('edit')} Editar</button><button class="btn btn-danger btn-sm" data-action="delete-count" data-id="${c.id}">${I('trash')} Borrar</button></div></div><div class="amount">${nfmt(c.qty)}</div></div>`}).join(''):`<div class="empty" style="padding-top:32px">${I('inventory')}<p style="margin-top:8px">Aquí aparecerán tus productos registrados.</p></div>`}${mySurplusMarkup()}</div></section></div></div>`}
 function searchSuggestions(){const q=STATE.workerQuery.trim();if(!q||STATE.selected)return'';let found=STORE.products.filter(p=>matches(p,q)).slice(0,7);return `<div class="suggestions">${found.length?found.map(p=>`<button type="button" class="suggestion" data-action="pick-product" data-id="${p.id}"><strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.code)} · ${escapeHtml(p.presentation||p.category||'Sin categoría')}</small></button>`).join(''):`<div class="empty">Sin coincidencias. Consulta al supervisor si el producto no está en el catálogo.</div>`}</div>`}
 function selectedMarkup(){let p=STORE.products.find(x=>x.id===STATE.selected);return p?`<div class="selected-prod"><div>${I('check','status-green')} <strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.code)} · ${escapeHtml(p.presentation||'')}</small></div><button class="btn btn-outline btn-icon" type="button" data-action="clear-product" title="Cambiar producto">${I('close')}</button></div>`:''}
 function updateSuggestions(){let x=document.getElementById('suggestions'),p=document.getElementById('selected-product');if(x)x.innerHTML=searchSuggestions();if(p)p.innerHTML=selectedMarkup();updateUnitControls()}
@@ -995,7 +1124,7 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    await navigator.clipboard.writeText(data);notify(`${rows.length} filas copiadas.`);
  }else if(action==='download-filter'){
    exportCsv(filteredRowsCSV(),`puntofarma_${STATE.status}_${localToday()}.csv`);
- }else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;render()}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
+ }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;render()}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
  else if(action==='review-units'){showUnitReview(id)}else if(action==='keep-theory'){const p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto no encontrado.');if(!confirm('¿Confirmas que el teórico actual está expresado en unidades y NO debe multiplicarse? Se mantendrá la diferencia física.'))return;await adapter.updateProduct(id,{unitReviewResolved:true});closeModal();notify('Confirmado: teórico conservado como unidades.');if(STORE.appMode==='demo')render()}else if(action==='edit-product'){showProductEditor(id)}else if(action==='new-product'){showProductEditor(null)}else if(action==='delete-product'){let p=STORE.products.find(x=>x.id===id);if(!confirm(`¿Eliminar ${p?.name||'este producto'} del catálogo?`))return;await adapter.deleteProduct(id);notify('Producto eliminado.');if(STORE.appMode==='demo')render()}
  else if(action==='update-theory'){invoiceUpdateModal()}else if(action==='reconcile-existing-surplus'){INVOICE_REVIEW={items:[],applied:true,links:[]};invoiceReconcileModal()}else if(action==='invoice-suggested'){invoiceBulkSuggested()}else if(action==='invoice-assume-units'){invoiceBulkSingle()}else if(action==='invoice-backup'){invoiceBackup()}else if(action==='invoice-preview-export'){invoiceExportPreview()}else if(action==='invoice-link-review'){invoiceRenderLinks()}else if(action==='invoice-link-toggle'){invoiceToggleLink(id,b.checked)}else if(action==='invoice-link-all'){invoiceSelectSafeLinks()}else if(action==='invoice-link-none'){invoiceClearLinks()}else if(action==='invoice-manual-link'){invoiceManualLinkModal(id)}else if(action==='invoice-previous'){INVOICE_REVIEW.current=Math.max(0,INVOICE_REVIEW.current-1);invoiceRenderReview()}else if(action==='invoice-next'){INVOICE_REVIEW.current++;invoiceRenderReview()}else if(action==='import-modal'){importModal()}else if(action==='reset-modal'){resetModal(b.dataset.mode)}else if(action==='new-admin'){modalNewAdmin()}else if(action==='change-pass'){modalPassword(id)}else if(action==='toggle-user'){if(!confirm('¿Cambiar el estado de este acceso?'))return;await adapter.toggleUser(id);notify('Estado actualizado.');if(STORE.appMode==='demo')render()}
  else if(action==='export-surplus'){exportCsv(surplusCSV(),'puntofarma_sobrantes_manuales.csv')}else if(action==='export-counts'){exportCsv(countCSV(),'puntofarma_conteos.csv')}else if(action==='export-expiry'){exportCsv([...STORE.counts.map(c=>{const p=STORE.products.find(x=>x.id===c.skuId);return {codigo:p?.code||'',producto:p?.name||'',colaborador:c.name,posicion:c.position,cantidad:c.qty,caducidad:formatDate(c.expiry),registro:c.createdAt||'',origen:'Conteo físico'}}).filter(x=>x.caducidad),...surplusCSV()],'puntofarma_caducidades.csv')}else if(action==='export-inventory'){exportCsv(STORE.products.map(p=>({codigo:p.code,producto:p.name,categoria:p.category,presentacion:p.presentation,teorico:p.theoretical,costoTotal:p.costTotal})),'puntofarma_inventario.csv')}
