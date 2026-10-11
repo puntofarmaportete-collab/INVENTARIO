@@ -279,7 +279,7 @@ const demoAdapter={
  async applyTheoryUpdate(ps,onProgress){await demoAdapter.upsertProducts(ps);onProgress?.(ps.length,ps.length)},
  async updateProduct(id,updates){let p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto no encontrado.');Object.assign(p,updates);syncLocal()},
  async deleteProduct(id){if(STORE.counts.some(c=>c.skuId===id))throw Error('Este producto tiene conteos. Primero revisa sus registros.');STORE.products=STORE.products.filter(p=>p.id!==id);syncLocal()},
- async queueRecounts(tasks){for(const t of tasks){if(STORE.recounts.some(x=>x.skuId===t.skuId))continue;STORE.recounts.push({...t})}syncLocal()},
+ async queueRecounts(tasks){let created=0,already=0;for(const t of tasks){if(STORE.recounts.some(x=>x.skuId===t.skuId)){already++;continue}STORE.recounts.push({...t});created++}syncLocal();return{created,already,failed:0}},
  async claimRecount(skuId){let t=STORE.recounts.find(x=>x.skuId===skuId);if(!t||t.status!=='pending')throw Error('Este código ya fue reservado.');Object.assign(t,{status:'in_progress',assignedUid:STORE.uid,assignedName:STORE.user.displayName,attemptId:strId(),claimedAt:now(),updatedAt:now()});syncLocal()},
  async releaseRecount(skuId){let t=STORE.recounts.find(x=>x.skuId===skuId);if(!t)throw Error('No existe el código.');if(STORE.role!=='supervisor'&&t.assignedUid!==STORE.uid)throw Error('No puedes liberar este código.');if(t.status!=='in_progress')throw Error('Solo se pueden liberar códigos en reconteo.');Object.assign(t,{status:'pending',assignedUid:'',assignedName:'',attemptId:'',claimedAt:'',updatedAt:now()});syncLocal()},
  async saveRecountEntry(entry){let t=STORE.recounts.find(x=>x.skuId===entry.skuId);if(!t||t.status!=='in_progress'||t.assignedUid!==STORE.uid)throw Error('El código ya no está reservado para ti.');STORE.recountEntries.push({...entry,attemptId:t.attemptId});syncLocal()},
@@ -382,26 +382,36 @@ const firebaseAdapter={
  async queueRecounts(tasks){
   const {fsm,db}=fb;
   let created=0,already=0,failed=0;
-  // Grupos pequeños: permiten enviar muchos códigos sin serializar cientos de transacciones.
+  const confirmed=[];
+  let firstFailure='';
+  // La transacción garantiza que dos supervisores no creen el mismo reconteo.
   for(let i=0;i<tasks.length;i+=6){
-    const results=await Promise.allSettled(tasks.slice(i,i+6).map(async t=>{
+    const group=tasks.slice(i,i+6);
+    const results=await Promise.allSettled(group.map(async t=>{
       const ref=fsm.doc(db,'recounts',t.skuId);
       return fsm.runTransaction(db,async tx=>{
         const snap=await tx.get(ref);
-        if(snap.exists())return false;
+        if(snap.exists())return {created:false,existing:{skuId:t.skuId,...snap.data()}};
         tx.set(ref,t);
-        return true;
+        return {created:true};
       });
     }));
-    for(const r of results){
-      if(r.status==='rejected')failed++;
-      else if(r.value)created++;
-      else already++;
-    }
+    results.forEach((r,n)=>{
+      if(r.status==='rejected'){
+        failed++;
+        if(!firstFailure)firstFailure=r.reason?.message||'Error de Firebase';
+      }else if(r.value?.created){created++;confirmed.push(group[n])}
+      else {already++;if(r.value?.existing)confirmed.push(r.value.existing)};
+    });
   }
-  if(failed)throw Error(`Se enviaron ${created} códigos; ${failed} fallaron. Revisa la lista antes de reintentar. Los ya enviados no se duplicarán.`);
-  if(!created)throw Error('Los códigos seleccionados ya estaban enviados.');
-},
+  // Tras confirmar la escritura, mover inmediatamente a la cola de reconteos.
+  // No modifica el catálogo, el stock teórico ni el primer conteo.
+  for(const t of confirmed){
+    if(!STORE.recounts.some(x=>x.skuId===t.skuId))STORE.recounts.push({...t});
+  }
+  if(failed)throw Error(`${created} código(s) enviados, ${failed} sin enviar. ${firstFailure}. Revisa «Reconteos enviados» antes de reintentar.`);
+  return {created,already,failed};
+ },
  async claimRecount(skuId){const {fsm,db}=fb,ref=fsm.doc(db,'recounts',skuId);await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(!snap.exists()||snap.data().status!=='pending')throw Error('Otro colaborador ya tomó ese código. Actualiza la lista.');tx.update(ref,{status:'in_progress',assignedUid:STORE.uid,assignedName:STORE.user.displayName,attemptId:strId(),claimedAt:now(),updatedAt:now()})})},
  async releaseRecount(skuId){const {fsm,db}=fb,ref=fsm.doc(db,'recounts',skuId);await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(!snap.exists()||snap.data().status!=='in_progress')throw Error('El reconteo ya no está activo.');if(STORE.role!=='supervisor'&&snap.data().assignedUid!==STORE.uid)throw Error('No tienes permiso para liberar este código.');tx.update(ref,{status:'pending',assignedUid:'',assignedName:'',attemptId:'',claimedAt:'',updatedAt:now()})})},
  async saveRecountEntry(entry){const t=STORE.recounts.find(x=>x.skuId===entry.skuId);if(!t||t.status!=='in_progress'||t.assignedUid!==STORE.uid)throw Error('No tienes reservado el código.');await fb.fsm.setDoc(fb.fsm.doc(fb.db,'recount_entries',entry.id),{...entry,attemptId:t.attemptId})},
@@ -849,8 +859,9 @@ function compute(){
 }
 function kpi(label,val,icon,accent='',sub=''){return `<div class="surface kpi"><div class="kpi-label"><span class="mini-icon ${accent}">${I(icon)}</span>${label}</div><span class="stat-value ${accent==='green'?'status-green':accent==='red'?'status-red':accent==='amber'?'status-amber':''}">${val}</span>${sub?`<div class="kpi-sub">${sub}</div>`:''}</div>`}
 function dashboardMarkup(){
+ const queued=new Set(STORE.recounts.map(t=>t.skuId));
  const {summary:s,statuses}=compute(),last=[...STORE.counts].sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt))).slice(0,6);
- const counts={all:s.total,ok:s.exact,missing:statuses.filter(p=>p.status==='missing').length,extra:s.extra,review:s.review,pending:s.unseen,outside:STORE.surplus.filter(x=>!x.linkedSkuId).length};
+ const counts={all:s.total,ok:s.exact,missing:statuses.filter(p=>p.status==='missing'&&!queued.has(p.id)).length,extra:statuses.filter(p=>p.status==='extra'&&!queued.has(p.id)).length,review:s.review,pending:statuses.filter(p=>p.status==='pending'&&!queued.has(p.id)).length,outside:STORE.surplus.filter(x=>!x.linkedSkuId).length};
  const nav=[['all','Todos','inventory',''],['ok','Cuadrados','check','green'],['missing','Faltantes contados','alert','red'],['extra','Sobrantes','upload','amber'],['review','Revisar presentación','alert','amber'],['pending','Sin contar','inventory',''],['outside','Fuera de stock','upload','amber']];
  const tiles=`<div class="novelties-grid" id="dashboard-status-tabs">${nav.map(([key,title,ico,tone])=>`<button type="button" aria-pressed="${STATE.status===key}" class="novelty-tile ${tone} ${STATE.status===key?'active':''}" data-action="status-filter" data-status="${key}"><span class="novelty-icon">${I(ico)}</span><span class="novelty-info"><span class="novelty-label">${title}</span><strong class="novelty-number">${nfmt(counts[key])}</strong></span></button>`).join('')}</div>`;
  const currentLabel=nav.find(x=>x[0]===STATE.status)?.[1]||'Todos';
@@ -866,7 +877,7 @@ function dashboardMarkup(){
  ${s.review?`<div class="hint-strip unit-review-notice"><strong>${nfmt(s.review)} producto(s) requieren validar si el Excel registra cajas o unidades.</strong> Las cifras por unidades siguen sujetas a confirmación, sin cambiar los conteos físicos.</div>`:''}
  <section class="surface pad novelties-detail" id="status-detail"><div class="surface-head"><div><h3 class="surface-title">Detalle: <span id="current-status-label">${currentLabel}</span></h3><p>Filtra por producto, código o categoría.</p></div><div class="page-actions"><button class="btn btn-outline btn-sm" data-action="copy-filter">${I('copy')} Copiar</button><button class="btn btn-outline btn-sm" data-action="download-filter">${I('download')} Descargar</button></div></div>
    <div class="toolbar search-toolbar"><div class="search-wrap">${I('search')}<input class="input" id="dashboard-search" placeholder="Buscar por código, nombre o categoría…" value="${escapeHtml(STATE.query)}"></div></div>
-   <div class="recount-toolbar" id="recount-toolbar" ${STATE.status==='outside'||STATE.status==='review'?'hidden':''}><label><input id="select-all-novelties" type="checkbox"> Seleccionar novedades de la vista</label><span class="small muted">Incluye faltantes, sobrantes y códigos sin contar; el primer conteo permanece intacto</span><button class="btn btn-primary btn-sm" data-action="queue-selected">${I('refresh')} Enviar seleccionados a reconteo</button></div>
+   <div class="recount-toolbar" id="recount-toolbar" ${STATE.status==='outside'||STATE.status==='review'?'hidden':''}><label><input id="select-all-novelties" type="checkbox"> Seleccionar novedades de la vista</label><span class="small muted">Solo códigos no enviados. Los enviados desaparecen de esta lista y aparecen en «Reconteos enviados».</span><button class="btn btn-primary btn-sm" data-action="queue-selected">${I('refresh')} Enviar seleccionados a reconteo</button></div>
    <div id="dashboard-table">${dashboardTable(statuses)}</div></section>
  <section class="surface pad recent-card overview-recent"><div class="surface-head"><h3 class="surface-title">Últimos conteos registrados</h3><span class="pill green"><span class="dot"></span> Actualizado</span></div><div class="activity-list">${last.length?last.map(c=>{let p=STORE.products.find(x=>x.id===c.skuId);return `<div class="activity-row">${avatar(c.name)}<div class="activity-copy"><strong>${escapeHtml(c.name)}</strong><small>${escapeHtml(p?.name||'Producto eliminado')} · Posición ${escapeHtml(c.position)}</small></div><div class="activity-q">${nfmt(c.qty)} <small>und.</small></div></div>`}).join(''):`<div class="empty">Los últimos productos registrados aparecerán aquí.</div>`}</div></section>
  ${recountSupervisorMarkup(statuses)}`;
@@ -877,11 +888,13 @@ function outsideRows(){const q=norm(STATE.query).split(/\s+/).filter(Boolean);re
 function outsideTable(){const rows=outsideRows(),limit=14,max=Math.max(1,Math.ceil(rows.length/limit));STATE.page=Math.max(0,Math.min(STATE.page,max-1));const page=rows.slice(STATE.page*limit,(STATE.page+1)*limit);return `<div class="hint-strip outside-hint"><span><strong>Fuera de stock</strong> · Productos reportados manualmente porque no constan en el catálogo. No se suman a los sobrantes por diferencia ni al ERI hasta su revisión.</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Colaborador</th><th class="right">Unidades</th><th>Caducidad</th><th>Registro</th><th class="right">Acciones</th></tr></thead><tbody>${page.length?page.map(c=>`<tr><td><div class="product-name" title="${escapeHtml(c.productName)}">${escapeHtml(c.productName)}</div><span class="product-code">${escapeHtml(c.code)}</span></td><td>${escapeHtml(c.name||'—')}</td><td class="right bold">${nfmt(c.qty)}</td><td>${formatDate(c.expiry)}</td><td>${escapeHtml(c.createdAt||'—')}</td><td class="right"><button class="btn btn-outline btn-icon" data-action="edit-surplus" data-id="${escapeHtml(c.id)}" title="Editar">${I('edit')}</button> <button class="btn btn-danger btn-icon" data-action="delete-surplus" data-id="${escapeHtml(c.id)}" title="Eliminar">${I('trash')}</button></td></tr>`).join(''):'<tr><td colspan="6" class="empty">No hay productos fuera de stock con este filtro.</td></tr>'}</tbody></table></div>${pagination(rows.length,limit,STATE.page,'dash')}`}
 function dashboardTable(rows){
  if(STATE.status==='outside')return outsideTable();
- const search=rows.filter(p=>matches(p,STATE.query,statusLabel[p.status])&&(STATE.status==='all'||p.status===STATE.status));
+ const queued=new Set(STORE.recounts.map(t=>t.skuId));
+ const search=rows.filter(p=>matches(p,STATE.query,statusLabel[p.status])&&(STATE.status==='all'||p.status===STATE.status)&&
+   (STATE.status==='all'||!queued.has(p.id)));
  const limit=14,max=Math.max(1,Math.ceil(search.length/limit));STATE.page=Math.max(0,Math.min(STATE.page,max-1));
  let page=search.slice(STATE.page*limit,(STATE.page+1)*limit);
  const reviewHelp=STATE.status==='review'?`<div class="hint-strip unit-review-notice">Estos artículos podrían estar expresados en cajas en el Excel. Comprueba la presentación antes de ajustar el teórico; los conteos y caducidades se conservan.</div>`:'';
- return `${reviewHelp}<div class="table-scroll reconciliation-scroll"><table class="data-table reconciliation-table"><thead><tr><th><span class="sr-only">Seleccionar</span></th><th>Producto / código</th><th>Categoría</th><th class="right">Teórico</th><th class="right">Físico</th><th class="right">Dif.</th><th>Estado</th><th class="right">Detalle</th></tr></thead><tbody>${page.length?page.map(p=>`<tr class="recon-row"><td data-label="Seleccionar" class="recon-select"><input type="checkbox" data-action="select-novelty" data-id="${escapeHtml(p.id)}" ${p.status==='missing'||p.status==='extra'||p.status==='pending'?'':'disabled'} ${STATE.recountSelection.has(p.id)?'checked':''} title="Seleccionar para reconteo"></td><td data-label="Producto" class="recon-product"><div class="product-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div><span class="product-code">${escapeHtml(p.code)}</span></td><td data-label="Categoría" class="recon-category">${escapeHtml(p.category||'Sin categoría')}</td><td data-label="Teórico" class="right bold">${nfmt(p.theoretical)}</td><td data-label="Físico" class="right">${nfmt(p.physical)}</td><td data-label="Diferencia" class="right bold ${p.difference<0?'status-red':p.difference>0?'status-amber':''}">${p.status==='review'?'Por confirmar':`${p.difference>0?'+':''}${nfmt(p.difference)}`}</td><td data-label="Estado"><span class="state ${p.status}">${statusLabel[p.status]}</span></td><td data-label="Acción" class="right"><button title="${p.status==='review'?'Validar presentación':'Ver registros y posiciones'}" class="btn ${p.status==='review'?'btn-primary':'btn-outline'} btn-sm" data-action="${p.status==='review'?'review-units':'detail'}" data-id="${escapeHtml(p.id)}">${p.status==='review'?'Revisar':I('eye')}</button></td></tr>`).join(''):`<tr><td colspan="8" class="empty">No se encontraron resultados.</td></tr>`}</tbody></table></div>${pagination(search.length,limit,STATE.page,'dash')}`;
+ return `${reviewHelp}<div class="table-scroll reconciliation-scroll"><table class="data-table reconciliation-table"><thead><tr><th><span class="sr-only">Seleccionar</span></th><th>Producto / código</th><th>Categoría</th><th class="right">Teórico</th><th class="right">Físico</th><th class="right">Dif.</th><th>Estado</th><th class="right">Detalle</th></tr></thead><tbody>${page.length?page.map(p=>`<tr class="recon-row"><td data-label="Seleccionar" class="recon-select"><input type="checkbox" data-action="select-novelty" data-id="${escapeHtml(p.id)}" ${(p.status==='missing'||p.status==='extra'||p.status==='pending')&&!queued.has(p.id)?'':'disabled'} ${STATE.recountSelection.has(p.id)&&!queued.has(p.id)?'checked':''} title="Seleccionar para reconteo"></td><td data-label="Producto" class="recon-product"><div class="product-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div><span class="product-code">${escapeHtml(p.code)}</span></td><td data-label="Categoría" class="recon-category">${escapeHtml(p.category||'Sin categoría')}</td><td data-label="Teórico" class="right bold">${nfmt(p.theoretical)}</td><td data-label="Físico" class="right">${nfmt(p.physical)}</td><td data-label="Diferencia" class="right bold ${p.difference<0?'status-red':p.difference>0?'status-amber':''}">${p.status==='review'?'Por confirmar':`${p.difference>0?'+':''}${nfmt(p.difference)}`}</td><td data-label="Estado"><span class="state ${queued.has(p.id)?'pending':p.status}">${queued.has(p.id)?'Enviado a reconteo':statusLabel[p.status]}</span></td><td data-label="Acción" class="right"><button title="${p.status==='review'?'Validar presentación':'Ver registros y posiciones'}" class="btn ${p.status==='review'?'btn-primary':'btn-outline'} btn-sm" data-action="${p.status==='review'?'review-units':'detail'}" data-id="${escapeHtml(p.id)}">${p.status==='review'?'Revisar':I('eye')}</button></td></tr>`).join(''):`<tr><td colspan="8" class="empty">No se encontraron resultados.</td></tr>`}</tbody></table></div>${pagination(search.length,limit,STATE.page,'dash')}`;
 }
 function pagination(total,limit,page,kind){let end=Math.min((page+1)*limit,total),start=total?page*limit+1:0;return `<div class="pagination"><span>Mostrando ${start}–${end} de ${nfmt(total)}</span><div class="pagebtns"><button aria-label="Página anterior" data-action="page" data-kind="${kind}" data-step="-1" ${page===0?'disabled':''}>‹</button><button aria-label="Página siguiente" data-action="page" data-kind="${kind}" data-step="1" ${(page+1)*limit>=total?'disabled':''}>›</button></div></div>`}
 function selectedFiltered(){return compute().statuses.filter(p=>matches(p,STATE.query,statusLabel[p.status])&&(STATE.status==='all'||STATE.status===p.status))}
@@ -889,7 +902,7 @@ function filteredRowsCSV(){if(STATE.status==='outside')return outsideRows().map(
 function recountSupervisorMarkup(statuses){
  const tasks=STORE.recounts||[],pending=tasks.filter(t=>t.status==='pending'),busy=tasks.filter(t=>t.status==='in_progress'),done=tasks.filter(t=>t.status==='completed');
  const rows=tasks.slice().sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)));
- return `<section class="surface pad recount-supervisor" style="margin-top:16px"><div class="surface-head"><h3 class="surface-title">Reconteos enviados</h3><div class="chiprow"><span class="pill">${pending.length} pendientes</span><span class="pill yellow">${busy.length} reservados</span><span class="pill green">${done.length} finalizados</span></div></div>
+ return `<section id="recounts-sent" class="surface pad recount-supervisor" style="margin-top:16px"><div class="surface-head"><h3 class="surface-title">Reconteos enviados</h3><div class="chiprow"><span class="pill">${pending.length} pendientes</span><span class="pill yellow">${busy.length} reservados</span><span class="pill green">${done.length} finalizados</span></div></div>
  <div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / Código</th><th>Posiciones del primer conteo</th><th>Estado</th><th>Responsable</th><th>Verificación</th><th class="right">Acciones</th></tr></thead><tbody>${rows.length?rows.map(t=>{
   const p=statusForSku(t.skuId);const entries=STORE.recountEntries.filter(e=>e.skuId===t.skuId&&e.attemptId===t.attemptId);const q=entries.reduce((a,e)=>a+Number(e.qty||0),0);
   return `<tr><td><div class="product-name">${escapeHtml(t.name)}</div><span class="product-code">${escapeHtml(t.code)}</span></td><td>${(t.positions||[]).map(x=>`<span class="position-chip">${escapeHtml(x)}</span>`).join(' ')||'—'}</td><td><span class="state ${t.status==='completed'?'ok':t.status==='pending'?'pending':'extra'}">${t.status==='completed'?'Finalizado':t.status==='pending'?'Disponible':'En reconteo'}</span></td><td>${escapeHtml(t.assignedName||'—')}</td><td>${t.status==='completed'?`1.º ${nfmt(p?.physical||0)} → 2.º ${nfmt(q)} und.`:entries.length?`${entries.length} registro(s) nuevos`:'—'}</td><td class="right"><button class="btn btn-outline btn-sm" data-action="recount-detail" data-id="${escapeHtml(t.skuId)}" title="Ver detalle">${I('eye')}</button> ${t.status==='in_progress'?`<button class="btn btn-soft btn-sm" data-action="release-recount" data-id="${escapeHtml(t.skuId)}">Liberar</button>`:''}</td></tr>`}).join(''):'<tr><td class="empty" colspan="6">Envía códigos con diferencias desde Conciliación para comenzar.</td></tr>'}</tbody></table></div></section>`;
@@ -1156,7 +1169,8 @@ const refreshTable=debounce(updateTables,120);
 document.addEventListener('input',e=>{if(e.target.id==='dashboard-search'){STATE.query=e.target.value;STATE.page=0;refreshTable()}if(e.target.id==='inventory-search'){STATE.invQuery=e.target.value;STATE.invPage=0;refreshTable()}if(e.target.id==='expiry-search'){STATE.expiryQuery=e.target.value;refreshTable()}if(['worker-qty','box-factor'].includes(e.target.id))updateUnitControls();if(['unit-review-packs','unit-review-factor'].includes(e.target.id)){const packs=Number(document.getElementById('unit-review-packs')?.value),factor=Number(document.getElementById('unit-review-factor')?.value),preview=document.getElementById('unit-review-preview');if(preview&&Number.isSafeInteger(packs)&&Number.isSafeInteger(factor)&&packs>0&&factor>0)preview.innerHTML=`Teórico propuesto: <b>${nfmt(packs*factor)} unidades</b> (${nfmt(packs)} × ${nfmt(factor)}). Revisa antes de confirmar.`;}if(e.target.id==='worker-search'){STATE.workerQuery=e.target.value;STATE.selected=null;updateSuggestions()}if(e.target.id==='worker-expiry'){let el=document.getElementById('expiry-preview');let normalized=expiryInput(e.target.value);if(el)el.textContent=normalized?formatDate(normalized):e.target.value?'Usa 4 números: MMAA (ej. 0826)':'Ej. 0826 = Agosto/2026'}});
 document.addEventListener('change',e=>{if(e.target.matches('[data-invoice-factor]')){invoiceEditFactor(e.target.dataset.invoiceFactor,e.target.value);return;}if(e.target.matches('[data-invoice-qty]')){invoiceEditQuantity(e.target.dataset.invoiceQty,e.target.value);return;}if(e.target.matches('[data-invoice-target]')){invoiceChooseTarget(e.target.dataset.invoiceTarget,e.target.value);return;}if(e.target.id==='invoice-filter'){INVOICE_REVIEW.filter=e.target.value;invoiceRenderReview();return;}if(e.target.id==='invoice-confirm'){INVOICE_REVIEW.confirmed=e.target.checked;invoiceRefreshControls();return;}if(e.target.id==='invoice-backup-ready'){INVOICE_REVIEW.backedUp=e.target.checked;invoiceRefreshControls();return;}if(e.target.matches('[data-invoice-link-check]')){invoiceToggleLink(e.target.dataset.invoiceLinkCheck,e.target.checked);return;}
 if(e.target.id==='select-all-novelties'){
-  const eligible=selectedFiltered().filter(p=>p.status==='missing'||p.status==='extra'||p.status==='pending');
+  const queued=new Set(STORE.recounts.map(t=>t.skuId));
+  const eligible=selectedFiltered().filter(p=>(p.status==='missing'||p.status==='extra'||p.status==='pending')&&!queued.has(p.id));
   for(const p of eligible){if(e.target.checked)STATE.recountSelection.add(p.id);else STATE.recountSelection.delete(p.id)}
   document.querySelectorAll('input[data-action="select-novelty"]').forEach(box=>{box.checked=STATE.recountSelection.has(box.dataset.id)});
  }if(e.target.id==='count-mode')updateUnitControls();if(e.target.id==='dashboard-status'){STATE.status=e.target.value;STATE.page=0;updateTables()}if(e.target.id==='expiry-range'){STATE.expiryRange=e.target.value;updateTables()}});
@@ -1193,12 +1207,34 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    STATE.status=b.dataset.status;STATE.page=0;const tabs=document.getElementById('dashboard-status-tabs');
    if(tabs)tabs.querySelectorAll('.novelty-tile').forEach(x=>{const active=x.dataset.status===STATE.status;x.classList.toggle('active',active);x.setAttribute('aria-pressed',String(active));});const title=document.getElementById('current-status-label');if(title)title.textContent=({all:'Todos',ok:'Cuadrados',missing:'Faltantes contados',extra:'Sobrantes',review:'Revisar presentación',pending:'Sin contar',outside:'Fuera de stock'})[STATE.status]||'Todos';const rt=document.getElementById('recount-toolbar');if(rt)rt.hidden=STATE.status==='outside'||STATE.status==='review';updateTables();document.getElementById('status-detail')?.scrollIntoView({behavior:'smooth',block:'start'});
  }else if(action==='queue-selected'){
-   const chosen=compute().statuses.filter(p=>STATE.recountSelection.has(p.id)&&(p.status==='missing'||p.status==='extra'||p.status==='pending'));
-   const tasks=chosen.filter(p=>!STORE.recounts.some(x=>x.skuId===p.id));
-   if(!tasks.length)throw Error('Selecciona códigos sin contar, con faltantes o sobrantes que todavía no estén enviados a reconteo.');
-   if(!confirm(`¿Enviar ${tasks.length} código(s) a reconteo? Los códigos sin contar se incluirán sin posiciones previas. No se borrará ni cambiará el primer conteo.`))return;
-   await adapter.queueRecounts(tasks.map(p=>({skuId:p.id,code:p.code,name:p.name,positions:[...new Set(STORE.counts.filter(c=>c.skuId===p.id).map(c=>String(c.position)))].sort((a,b)=>Number(a)-Number(b)),status:'pending',assignedUid:'',assignedName:'',claimedAt:'',createdAt:now(),attemptId:'',updatedAt:now()})));
-   STATE.recountSelection.clear();notify(`${tasks.length} código(s) enviados a reconteo.`);render();
+   // Recuperar también los checks visibles en pantalla para evitar selecciones perdidas
+   // mientras llegan actualizaciones en vivo de Firebase.
+   document.querySelectorAll('input[data-action="select-novelty"]:checked').forEach(x=>STATE.recountSelection.add(x.dataset.id));
+   const all=compute().statuses.filter(p=>STATE.recountSelection.has(p.id)&&['missing','extra','pending'].includes(p.status));
+   const sent=new Set(STORE.recounts.map(t=>t.skuId));
+   const tasks=all.filter(p=>!sent.has(p.id));
+   if(!tasks.length){
+     STATE.recountSelection.clear();render();
+     if(all.length){notify(`${all.length} código(s) ya están en «Reconteos enviados».`);document.getElementById('recounts-sent')?.scrollIntoView({behavior:'smooth',block:'start'});}
+     else notify('Marca primero los códigos pendientes de enviar a reconteo.','error');
+     return;
+   }
+   if(!confirm(`¿Enviar ${tasks.length} código(s) a reconteo? Desaparecerán de los estados pendientes de envío y aparecerán en «Reconteos enviados». Los conteos originales se conservarán.`))return;
+   const payload=tasks.map(p=>({skuId:p.id,code:p.code,name:p.name,positions:[...new Set(STORE.counts.filter(c=>c.skuId===p.id).map(c=>String(c.position)))].sort((a,b)=>Number(a)-Number(b)),status:'pending',assignedUid:'',assignedName:'',claimedAt:'',createdAt:now(),attemptId:'',updatedAt:now()}));
+   try{
+     const result=await adapter.queueRecounts(payload);
+     const sentNow=result?.created??tasks.length;
+     STATE.recountSelection.clear();
+     render();
+     notify(sentNow?`${sentNow} código(s) enviados correctamente a Reconteo.`:'Los códigos ya figuran en Reconteos enviados.');
+     document.getElementById('recounts-sent')?.scrollIntoView({behavior:'smooth',block:'start'});
+   }catch(err){
+     // Mostrar también los envíos parciales confirmados: no deben reaparecer
+     // como pendientes ni anunciar éxito si Firebase rechazó alguna escritura.
+     STATE.recountSelection=new Set(tasks.filter(p=>!STORE.recounts.some(t=>t.skuId===p.id)).map(p=>p.id));
+     render();
+     throw err;
+   }
  }else if(action==='copy-filter'){
    const rows=filteredRowsCSV();if(!rows.length)throw Error('El filtro no tiene registros.');
    const col=Object.keys(rows[0]),data=[col.join('\t'),...rows.map(x=>col.map(k=>String(x[k]??'')).join('\t'))].join('\n');
