@@ -511,8 +511,8 @@ function scheduleRender(){clearTimeout(toastTimer);toastTimer=setTimeout(()=>{if
    }
    return;
   }
-  if(STORE.role==='recount'&&STORE.ready&&STATE.screen==='app'){
-    // Actualizar la cola sin interrumpir el teclado ni los campos del reconteo.
+  if(STORE.role==='recount'&&STORE.ready&&STATE.screen==='app'&&document.querySelector('#recount-queue')){
+    // Actualizar la cola solo cuando ya existe en pantalla. Si sigue el cargador, render() dibuja la vista inicial.
     const assigned=STORE.recounts.some(t=>t.status==='in_progress'&&t.assignedUid===STORE.uid);
     if(document.querySelector('#recount-form')&&!assigned){render();return}
     const fresh=document.createElement('div');fresh.innerHTML=recountMarkup();
