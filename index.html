@@ -46,6 +46,7 @@
 .loc-current strong{font-size:15px;color:#126f95}
 .loc-recent{margin-top:16px}.loc-recent-row{border-bottom:1px solid #edf2f6;padding:11px 0;display:flex;justify-content:space-between;gap:12px;align-items:center}
 .loc-recent-row strong{font-size:12px;display:block}.loc-recent-row small{color:var(--muted);font-size:11px}.loc-recent-product{min-width:0;flex:1;overflow-wrap:anywhere}.loc-recent-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.loc-recent-actions .btn{white-space:nowrap}.loc-form-actions{display:grid;grid-template-columns:1fr auto;gap:9px;margin-top:6px}.loc-form-actions .btn{min-height:42px}@media(max-width:480px){.loc-recent-row{align-items:flex-start;flex-direction:column}.loc-recent-actions{justify-content:flex-start}.loc-form-actions{grid-template-columns:1fr 1fr}}
+.loc-consult{max-width:780px;margin:0 auto}.loc-consult-search{position:relative}.loc-consult-search>svg{position:absolute;left:14px;top:13px;color:#718fa2}.loc-consult-search input{padding-left:42px}.loc-consult-row{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 8px;border-bottom:1px solid var(--line)}.loc-consult-row:last-child{border-bottom:0}.loc-consult-row strong,.loc-consult-row small{display:block}.loc-consult-row strong{font-size:13px;overflow-wrap:anywhere}.loc-consult-row small{font-size:11px;color:var(--muted);margin-top:3px}.loc-consult-row .pill{flex-shrink:0}.loc-admin-filters{display:grid;grid-template-columns:minmax(0,1fr) 165px;gap:11px;margin:15px 0}.loc-admin-filters .search-wrap{margin:0}.loc-admin-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px}.loc-admin-footer .toolbar{display:flex;gap:8px}@media(max-width:680px){.loc-admin-filters{grid-template-columns:1fr}.loc-admin-footer{align-items:flex-start;flex-direction:column}.loc-header .toolbar{gap:5px}.loc-header .toolbar .btn-sm{padding:7px 9px;font-size:11px}}
 .loc-shell input{font-size:16px!important}.loc-instructions{font-size:12px;color:var(--muted);margin:4px 0 15px;line-height:1.5}
 @media(max-width:700px){.loc-shell{padding:12px 12px 45px}.loc-grid{grid-template-columns:1fr}.loc-title{font-size:22px}.loc-header .logo-img{width:146px}.loc-metrics{gap:6px}}
 /* PuntoFarma · mejoras para celulares, conteo sin saltos de teclado */
@@ -269,14 +270,16 @@ const SYNC_DOC='pf_catalog_version';
 const CACHE_NS='PF_FIRESTORE_CACHE_'+String(window.PF_FIREBASE_CONFIG?.projectId||'local')+'_';
 const CACHE_MAX_AGE_MS=24*60*60*1000;
 const LOCATIONS_CACHE_AGE_MS=6*60*60*1000;
+const LOCATIONS_REFRESH_GAP_MS=30*1000;
+let locationRemoteFetchedAt=0,locationLoadPending=null;
 const LOCATION_CODES=[...[1,3,4,6,8,9,10,11].flatMap(t=>Array.from({length:5},(_,n)=>`T${t}-N${n+1}`)),...[1,2,3,4,5].flatMap(v=>Array.from({length:4},(_,n)=>`V${v}-N${n+1}`)),...[1,2,3].flatMap(p=>Array.from({length:6},(_,n)=>`P${p}-N${n+1}`))];
 const LOCATION_SET=new Set(LOCATION_CODES);
 function readCache(key){try{return JSON.parse(localStorage.getItem(CACHE_NS+key)||'null')}catch{return null}}
 function writeCache(key,value){try{localStorage.setItem(CACHE_NS+key,JSON.stringify(value))}catch(e){console.warn('Caché local no disponible',e)}}
-const sheetNames={dashboard:'Control de inventario',inventory:'Mi inventario',expiry:'Caducidades',users:'Configuración'};
-const navIcons={dashboard:'dashboard',inventory:'inventory',expiry:'calendar',users:'users'};
-const STORE={products:[],counts:[],surplus:[],markers:[],recounts:[],recountEntries:[],profiles:[],locations:[],locationsLoaded:false,appMode:'demo',user:null,uid:null,role:null,connected:false,ready:false};
-const STATE={screen:'access',loginType:'',panel:'dashboard',collapsed:localStorage.getItem(PREFIX+'collapsed')==='true',query:'',status:'all',invQuery:'',expiryQuery:'',expiryRange:'all',page:0,invPage:0,selected:null,workerQuery:'',workerTab:'count',workerName:'',busy:false,editCountId:null,recountSelection:new Set(),recountActiveId:null,recountQuery:'',locationQuery:'',locationSkuId:null,locationCode:'',locationBusy:false};
+const sheetNames={dashboard:'Control de inventario',inventory:'Mi inventario',locations:'Ubicaciones',expiry:'Caducidades',users:'Configuración'};
+const navIcons={dashboard:'dashboard',inventory:'inventory',locations:'pin',expiry:'calendar',users:'users'};
+const STORE={products:[],counts:[],surplus:[],markers:[],recounts:[],recountEntries:[],profiles:[],locations:[],locationsLoaded:false,locationsSyncedAt:0,appMode:'demo',user:null,uid:null,role:null,connected:false,ready:false};
+const STATE={screen:'access',loginType:'',panel:'dashboard',collapsed:localStorage.getItem(PREFIX+'collapsed')==='true',query:'',status:'all',invQuery:'',expiryQuery:'',expiryRange:'all',page:0,invPage:0,selected:null,workerQuery:'',workerTab:'count',workerName:'',busy:false,editCountId:null,recountSelection:new Set(),recountActiveId:null,recountQuery:'',locationQuery:'',locationSkuId:null,locationCode:'',locationBusy:false,locationView:'assign',locationConsultQuery:'',locationAdminQuery:'',locationAdminFilter:'assigned',locationAdminPage:0,locationSupervisorRequested:false};
 let adapter=null, unsub=[], toastTimer, refreshMarkerProgress=null, refreshSupervisorFeeds=null;
 let INVOICE_REVIEW=null;
 const app=document.getElementById('app');
@@ -290,7 +293,7 @@ function avatar(n){let initials=String(n||'').split(/\s+/).slice(0,2).map(x=>x[0
 function badgeConnection(){return STORE.appMode==='demo'?`<span class="pill yellow"><span class="dot"></span> Demo local</span>`:`<span class="pill ${STORE.connected?'green':'yellow'}"><span class="dot"></span> ${STORE.connected?'Firebase conectado':'Sincronizando'}</span>`}
 function cleanSku(p){return {id:p.id,code:String(p.code||''),name:String(p.name||''),category:String(p.category||''),presentation:String(p.presentation||''),unitsPerPresentation:Number(p.unitsPerPresentation||1),packs:Number(p.packs||0),theoretical:Number(p.theoretical||0),pvpUnit:Number(p.pvpUnit||0),pvpTotal:Number(p.pvpTotal||0),costUnit:Number(p.costUnit||0),costTotal:Number(p.costTotal||0),sourceRows:p.sourceRows||[],unitReviewResolved:p.unitReviewResolved===true}}
 function publicProduct(p){return {id:p.id,code:p.code,name:p.name,category:p.category,presentation:p.presentation,unitsPerPresentation:p.unitsPerPresentation}}
-function loadLocalData(){let arr=loadDemo('products',null);if(!arr){arr=(window.PF_SEED_PRODUCTS||[]).map(cleanSku);saveDemo('products',arr)}STORE.products=arr;STORE.counts=loadDemo('counts',[]);STORE.surplus=loadDemo('surplus',[]);STORE.markers=STORE.counts.map(c=>({id:c.id,skuId:c.skuId,uid:c.uid}));STORE.recounts=loadDemo('recounts',[]);STORE.recountEntries=loadDemo('recountEntries',[]);STORE.profiles=loadDemo('profiles',[]);STORE.locations=loadDemo('locations',[]);STORE.locationsLoaded=true;STORE.connected=true}
+function loadLocalData(){let arr=loadDemo('products',null);if(!arr){arr=(window.PF_SEED_PRODUCTS||[]).map(cleanSku);saveDemo('products',arr)}STORE.products=arr;STORE.counts=loadDemo('counts',[]);STORE.surplus=loadDemo('surplus',[]);STORE.markers=STORE.counts.map(c=>({id:c.id,skuId:c.skuId,uid:c.uid}));STORE.recounts=loadDemo('recounts',[]);STORE.recountEntries=loadDemo('recountEntries',[]);STORE.profiles=loadDemo('profiles',[]);STORE.locations=loadDemo('locations',[]);STORE.locationsLoaded=true;STORE.locationsSyncedAt=Date.now();STORE.connected=true}
 function syncLocal(){saveDemo('products',STORE.products);saveDemo('counts',STORE.counts);saveDemo('surplus',STORE.surplus);saveDemo('recounts',STORE.recounts);saveDemo('recountEntries',STORE.recountEntries);saveDemo('profiles',STORE.profiles);saveDemo('locations',STORE.locations);STORE.markers=STORE.counts.map(c=>({id:c.id,skuId:c.skuId,uid:c.uid}))}
 const demoAdapter={
  async authenticate(username,password){const name=username.trim().toLowerCase(),u=STORE.profiles.find(x=>x.role==='supervisor'&&x.username===name&&x.active!==false);if(!u)throw Error('Usuario o contraseña incorrectos.');let h=await hashPassword(password,u.salt);if(h!==u.hash)throw Error('Usuario o contraseña incorrectos.');return u},
@@ -337,7 +340,7 @@ const demoAdapter={
  async deleteRecountEntry(id){const e=STORE.recountEntries.find(x=>x.id===id),t=STORE.recounts.find(x=>x.skuId===e?.skuId);if(!e||e.uid!==STORE.uid||t?.status!=='in_progress'||t.assignedUid!==STORE.uid||t.attemptId!==e.attemptId)throw Error('Este registro no puede borrarse.');STORE.recountEntries=STORE.recountEntries.filter(x=>x.id!==id);syncLocal()},
  async finishRecount(skuId){let t=STORE.recounts.find(x=>x.skuId===skuId);if(!t||t.assignedUid!==STORE.uid||t.status!=='in_progress')throw Error('Código no asignado.');if(!STORE.recountEntries.some(e=>e.skuId===skuId&&e.uid===STORE.uid&&e.attemptId===t.attemptId))throw Error('Guarda al menos un registro antes de finalizar.');Object.assign(t,{status:'completed',completedAt:now(),updatedAt:now()});syncLocal()},
  async resetData(mode){if(mode==='catalog'&&STORE.counts.length)throw Error('Borra primero los conteos.');if(mode==='counts'||mode==='all'){STORE.counts=[];STORE.surplus=[];STORE.recounts=[];STORE.recountEntries=[];}if(mode==='catalog'||mode==='all')STORE.products=[];syncLocal()},
- async loadLocations(){STORE.locations=loadDemo('locations',[]);STORE.locationsLoaded=true;scheduleRender()},
+ async loadLocations(){STORE.locations=loadDemo('locations',[]);STORE.locationsLoaded=true;STORE.locationsSyncedAt=Date.now();scheduleRender()},
  async saveLocation(skuId,location,expected){const old=STORE.locations.find(x=>x.skuId===skuId)||null;if((old?.updatedAt||'')!==(expected||''))throw Error('La ubicación cambió. Pulsa Actualizar y vuelve a intentar.');const doc={skuId,location,uid:STORE.uid,name:STORE.user.displayName,updatedAt:now()};STORE.locations=STORE.locations.filter(x=>x.skuId!==skuId).concat(doc);syncLocal();return doc},
  async deleteLocation(skuId,expected){const old=STORE.locations.find(x=>x.skuId===skuId);if(!old)throw Error('Este producto ya no tiene ubicación. Pulsa Actualizar.');if(String(old.updatedAt||'')!==String(expected||''))throw Error('Otro colaborador cambió esta ubicación. Pulsa Actualizar.');STORE.locations=STORE.locations.filter(x=>x.skuId!==skuId);syncLocal();},
  async start(){return true},async signOut(){}
@@ -571,14 +574,24 @@ const firebaseAdapter={
    throw Error('Opción de borrado desconocida.');
  },
  async loadLocations(force=false){
+  if(locationLoadPending)return locationLoadPending;
   const cache=readCache('locations');
   if(!force&&cache&&Array.isArray(cache.rows)&&Date.now()-Number(cache.at||0)<LOCATIONS_CACHE_AGE_MS){
-   STORE.locations=cache.rows;STORE.locationsLoaded=true;scheduleRender();return;
+   STORE.locations=cache.rows;STORE.locationsLoaded=true;STORE.locationsSyncedAt=Number(cache.at||0);scheduleRender();return;
   }
-  const {fsm,db}=fb;
-  const snaps=await fsm.getDocs(fsm.collection(db,'locations'));
-  STORE.locations=snaps.docs.map(d=>({skuId:d.id,...d.data()}));STORE.locationsLoaded=true;
-  writeCache('locations',{rows:STORE.locations,at:Date.now()});scheduleRender();
+  // Evitar refrescos compulsivos: una lectura de la colección puede cobrar por documento.
+  if(force&&STORE.locationsLoaded&&locationRemoteFetchedAt&&Date.now()-locationRemoteFetchedAt<LOCATIONS_REFRESH_GAP_MS){
+   scheduleRender();return;
+  }
+  locationLoadPending=(async()=>{
+   const {fsm,db}=fb;
+   const snaps=await fsm.getDocs(fsm.collection(db,'locations'));
+   const stamp=Date.now();
+   STORE.locations=snaps.docs.map(d=>({skuId:d.id,...d.data()}));
+   STORE.locationsLoaded=true;STORE.locationsSyncedAt=stamp;locationRemoteFetchedAt=stamp;
+   writeCache('locations',{rows:STORE.locations,at:stamp});scheduleRender();
+  })();
+  try{return await locationLoadPending}finally{locationLoadPending=null}
  },
  async saveLocation(skuId,location,expectedUpdatedAt){
   const {fsm,db}=fb; const ref=fsm.doc(db,'locations',skuId);
@@ -606,7 +619,7 @@ const firebaseAdapter={
  async start(role,uid){
   const {fsm,db}=fb;
   unsub.forEach(f=>f());unsub=[];refreshMarkerProgress=null;refreshSupervisorFeeds=null;
-  STORE.products=[];STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.recounts=[];STORE.recountEntries=[];STORE.profiles=[];STORE.locations=[];STORE.locationsLoaded=false;
+  STORE.products=[];STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.recounts=[];STORE.recountEntries=[];STORE.profiles=[];STORE.locations=[];STORE.locationsLoaded=false;STORE.locationsSyncedAt=0;
   STORE.ready=false;STORE.connected=false;STORE.syncIssue=null;STORE.progressReady=false;
   const received=new Set(),reported=new Set();
   // Los catálogos y el stock cambian poco: ya NO dejamos escuchas en vivo de
@@ -821,7 +834,7 @@ const firebaseAdapter={
       profiles:()=>[fsm.collection(db,'profiles'),a=>STORE.profiles=a]
     };
     const routes={dashboard:['surplus','recounts','recount_entries'],
-      inventory:['surplus'],expiry:['surplus'],users:['profiles']};
+      inventory:['surplus'],locations:[],expiry:['surplus'],users:['profiles']};
     refreshSupervisorFeeds=(route)=>{
       if(sessionStopped)return;
       const needed=new Set(routes[route]||routes.dashboard);
@@ -879,6 +892,13 @@ function firebasePassword(pin){
 function canBootstrap(username,pin){return username.trim().toLowerCase()==='kevin' && pin==='1234'}
 
 function scheduleRender(){clearTimeout(toastTimer);toastTimer=setTimeout(()=>{if(STATE.screen!=='app')return;
+ if(STORE.role==='supervisor'&&STORE.ready&&STATE.panel==='locations'&&document.getElementById('super-loc-table')){
+   updateSupervisorLocationsView();return;
+ }
+ if(STORE.role==='locations'&&STORE.ready&&STATE.locationView==='consult'&&document.getElementById('loc-consult-input')){
+   const box=document.getElementById('loc-consult-results');if(box)box.innerHTML=locationConsultResults();
+   const metric=document.getElementById('loc-metrics');if(metric)metric.innerHTML=locationStatsMarkup();return;
+ }
  if(STORE.role==='locations'&&STORE.ready&&document.getElementById('loc-search')){
    const tmp=document.createElement('div');tmp.innerHTML=locationsWorkerMarkup();
    for(const id of ['loc-metrics','loc-recent-list']){const old=document.getElementById(id),fresh=tmp.querySelector('#'+id);if(old&&fresh)old.replaceWith(fresh)}
@@ -912,8 +932,8 @@ function scheduleRender(){clearTimeout(toastTimer);toastTimer=setTimeout(()=>{if
   }
   render();
 },240)}
-function appEnter(role,user){if(STORE.appMode==='demo')loadLocalData();STORE.user=user;STORE.uid=user.id;STORE.role=role;STATE.screen='app';STATE.panel='dashboard';STATE.selected=null;STATE.query='';STATE.page=0;STATE.invPage=0;STATE.loginType='';STATE.recountActiveId=null;STATE.locationSkuId=null;STATE.locationQuery='';STATE.locationCode='';if(STORE.appMode==='firebase')adapter.start(role,user.id);render()}
-function signOut(){if(STORE.appMode==='firebase')adapter.signOut().catch(console.error);STORE.user=null;STORE.uid=null;STORE.role=null;STATE.screen='access';STATE.loginType='';STATE.selected=null;if(STORE.appMode==='firebase'){STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.products=[];STORE.profiles=[];STORE.recounts=[];STORE.recountEntries=[];STORE.locations=[];STORE.locationsLoaded=false};render()}
+function appEnter(role,user){if(STORE.appMode==='demo')loadLocalData();STORE.user=user;STORE.uid=user.id;STORE.role=role;STATE.screen='app';STATE.panel='dashboard';STATE.selected=null;STATE.query='';STATE.page=0;STATE.invPage=0;STATE.loginType='';STATE.recountActiveId=null;STATE.locationSkuId=null;STATE.locationQuery='';STATE.locationCode='';STATE.locationView='assign';STATE.locationConsultQuery='';STATE.locationAdminQuery='';STATE.locationAdminFilter='assigned';STATE.locationAdminPage=0;STATE.locationSupervisorRequested=false;if(STORE.appMode==='firebase')adapter.start(role,user.id);render()}
+function signOut(){if(STORE.appMode==='firebase')adapter.signOut().catch(console.error);STORE.user=null;STORE.uid=null;STORE.role=null;STATE.screen='access';STATE.loginType='';STATE.selected=null;if(STORE.appMode==='firebase'){STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.products=[];STORE.profiles=[];STORE.recounts=[];STORE.recountEntries=[];STORE.locations=[];STORE.locationsLoaded=false;STORE.locationsSyncedAt=0};render()}
 function entryMarkup(){let hasAdmin=STORE.profiles.some(p=>p.role==='supervisor');return `<div class="entry"><section class="entry-art"><div class="brand">${logo()}</div><div class="entry-illustration"><div class="entry-orbit"></div><div class="entry-circle">${I('inventory')}</div></div><div><h1>Tu inventario,<br><em>bajo control.</em></h1><div class="entry-art-footer">PUNTOFARMA · INVENTORY CONTROL · ECUADOR</div></div></section><section class="entry-right"><div class="entry-content">${!STATE.loginType?`<span class="eyebrow">Bienvenido a PuntoFarma</span><h2>¿Cómo deseas ingresar?</h2><button class="role-card" data-action="role" data-role="supervisor"><span class="role-icon">${I('shield')}</span><span><strong>Supervisión</strong><small>Administración y control de inventario</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="operator"><span class="role-icon lime">${I('inventory')}</span><span><strong>Conteo físico</strong><small>Registro de productos desde celular</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="recount"><span class="role-icon lime">${I('refresh')}</span><span><strong>Reconteo</strong><small>Revisión de códigos con novedades</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="locations"><span class="role-icon lime">${I('pin')}</span><span><strong>Ubicaciones</strong><small>Asignar productos a ubicaciones</small></span>${I('arrow','arrow-circle')}</button>`:(STATE.loginType==='operator'||STATE.loginType==='recount'||STATE.loginType==='locations')?`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">${STATE.loginType==='recount'?'Reconteo':STATE.loginType==='locations'?'Ubicaciones':'Conteo físico'}</span><h2>${STATE.loginType==='recount'?'Vamos a revisar novedades':STATE.loginType==='locations'?'Vamos a ubicar los productos':'Comencemos el inventario'}</h2><form class="form-stack" data-form="worker-login"><div class="field"><label>Tu nombre y apellido</label><input class="input" name="displayName" placeholder="Ej. María Rodríguez" required minlength="3" autocomplete="name" autofocus></div><button class="btn btn-primary btn-block">Ingresar ${I('arrow')}</button></form>`:`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">Acceso administrativo</span><h2>${STORE.appMode==='demo'&&!hasAdmin?'Configura el supervisor':'Acceso a Supervisión'}</h2><form class="form-stack" data-form="${STORE.appMode==='demo'&&!hasAdmin?'first-admin':'admin-login'}"><div class="field"><label>Usuario</label><input class="input" name="username" required placeholder="Ej. admin" minlength="3" autocomplete="username"></div>${STORE.appMode==='demo'&&!hasAdmin?`<div class="field"><label>Nombre visible</label><input class="input" name="displayName" required placeholder="Ej. Supervisor PuntoFarma"></div>`:''}<div class="field"><label>Contraseña</label><input class="input" name="password" type="password" required minlength="4" placeholder="Tu contraseña" autocomplete="${STORE.appMode==='demo'&&!hasAdmin?'new-password':'current-password'}"></div><button class="btn btn-primary btn-block">${STORE.appMode==='demo'&&!hasAdmin?'Crear supervisor':'Iniciar sesión'} ${I('arrow')}</button></form>`}</div></section></div>`}
 function render(){
  if(STATE.screen==='access'){app.innerHTML=entryMarkup();return}
@@ -923,7 +943,7 @@ function render(){
  app.innerHTML=STORE.role==='locations'?locationsWorkerMarkup():STORE.role==='recount'?recountMarkup():STORE.role==='operator'?workerMarkup():adminShell();
 }
 function adminShell(){const route=STATE.panel;return `<div class="shell"><aside class="sidebar ${STATE.collapsed?'collapsed':''}"><div class="sidebar-top"><span class="compact-only brand-mark">P</span><div class="brand-lockup">${logo(true)}</div><button class="btn btn-outline btn-icon" title="${STATE.collapsed?'Expandir':'Plegar'} menú" data-action="collapse">${I('menuopen')}</button></div><div class="side-body"><div class="side-section-label">ADMINISTRACIÓN</div>${Object.entries(sheetNames).map(([key,name])=>`<button class="nav-link ${route===key?'selected':''}" data-action="nav" data-route="${key}" title="${escapeHtml(name)}">${I(navIcons[key])}<span class="nav-text">${name}</span></button>`).join('')}</div><div class="sidebar-footer"><div class="sidebar-user">${avatar(STORE.user.displayName)}<div class="sidebar-user-details"><b>${escapeHtml(STORE.user.displayName||'Supervisor')}</b><small>Supervisión · PuntoFarma</small></div></div><button class="btn btn-outline" data-action="logout" style="width:100%;margin-top:9px">${I('exit')}<span>Salir</span></button></div></aside><main class="main"><header class="topbar"><div class="topbar-left"><span class="crumb">PuntoFarma <span class="muted">/</span> <strong>${sheetNames[route]}</strong></span></div><div class="topbar-right">${badgeConnection()}<span class="pill">${I('user')} ${escapeHtml(STORE.user.username||'Supervisor')}</span></div></header><div class="page" id="route-content">${adminContent()}</div></main></div>`}
-function adminContent(){return STATE.panel==='inventory'?inventoryMarkup():STATE.panel==='expiry'?expiryMarkup():STATE.panel==='users'?usersMarkup():dashboardMarkup()}
+function adminContent(){return STATE.panel==='inventory'?inventoryMarkup():STATE.panel==='locations'?supervisorLocationsMarkup():STATE.panel==='expiry'?expiryMarkup():STATE.panel==='users'?usersMarkup():dashboardMarkup()}
 const header=(title,sub,actions='')=>`<div class="page-title"><div><h1>${title}</h1></div>${actions?`<div class="page-actions">${actions}</div>`:''}</div>`;
 
 function suggestedFactor(p){
@@ -1182,14 +1202,78 @@ function locationStatsMarkup(){
  const valid=new Set(STORE.products.map(p=>p.id));const assigned=STORE.locations.filter(x=>valid.has(x.skuId)&&LOCATION_SET.has(x.location));
  return `<span class="pill green">${nfmt(assigned.length)} ubicados</span><span class="pill">${nfmt(STORE.products.length)} productos</span>${STORE.locationsLoaded?'':'<span class="pill yellow">Cargando…</span>'}`;
 }
+// Vista administrativa sin listeners: buscar, ordenar, filtrar y exportar usando datos locales.
+function locationAdminRows(){
+ const locBySku=new Map(STORE.locations.map(x=>[x.skuId,x]));
+ const q=norm(STATE.locationAdminQuery||'').trim().split(/\s+/).filter(Boolean);
+ return STORE.products.map(p=>({p,loc:locBySku.get(p.id)||null})).filter(x=>{
+  const assigned=Boolean(x.loc?.location&&LOCATION_SET.has(x.loc.location));
+  if(STATE.locationAdminFilter==='assigned'&&!assigned)return false;
+  if(STATE.locationAdminFilter==='pending'&&assigned)return false;
+  const search=norm([x.p.code,x.p.name,x.loc?.location,x.loc?.name].join(' '));
+  return q.every(w=>search.includes(w));
+ }).sort((a,b)=>String(b.loc?.updatedAt||'').localeCompare(String(a.loc?.updatedAt||''))||String(a.p.name).localeCompare(String(b.p.name)));
+}
+function locationAdminSummary(){
+ if(!STORE.locationsLoaded)return '<div class="surface pad"><span class="pill yellow">Cargando ubicaciones…</span></div>';
+ const valid=new Set(STORE.products.map(p=>p.id));
+ const assigned=STORE.locations.filter(x=>valid.has(x.skuId)&&LOCATION_SET.has(x.location));
+ const occupied=new Set(assigned.map(x=>x.location)).size;
+ return `<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Productos ubicados',nfmt(assigned.length),'pin','green')}${kpi('Sin ubicación',nfmt(Math.max(0,STORE.products.length-assigned.length)),'inventory')}${kpi('Espacios utilizados',nfmt(occupied)+' / '+LOCATION_CODES.length,'dashboard')}</div>`;
+}
+function locationAdminTable(){
+ if(!STORE.locationsLoaded)return '<div class="empty">Cargando asignaciones…</div>';
+ const rows=locationAdminRows(),perPage=50,maxPage=Math.max(0,Math.ceil(rows.length/perPage)-1);
+ STATE.locationAdminPage=Math.min(STATE.locationAdminPage,maxPage);
+ const shown=rows.slice(STATE.locationAdminPage*perPage,(STATE.locationAdminPage+1)*perPage);
+ const details=shown.map(({p,loc})=>`<tr><td><b>${escapeHtml(p.code)}</b></td><td>${escapeHtml(p.name)}</td><td>${loc?.location&&LOCATION_SET.has(loc.location)?`<span class="pill green">${escapeHtml(loc.location)}</span>`:'<span class="pill">Sin ubicación</span>'}</td><td>${escapeHtml(loc?.name||'—')}</td><td>${escapeHtml(locationStamp(loc?.updatedAt))}</td></tr>`).join('');
+ return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Código</th><th>Producto</th><th>Ubicación</th><th>Asignado por</th><th>Último registro</th></tr></thead><tbody>${details||'<tr><td colspan="5" class="empty">Sin productos con ese filtro.</td></tr>'}</tbody></table></div>
+ <div class="loc-admin-footer"><span class="muted small">${nfmt(rows.length)} resultados · Página ${STATE.locationAdminPage+1} de ${maxPage+1}</span><div class="toolbar"><button class="btn btn-outline btn-sm" data-action="loc-admin-page" data-step="-1" ${STATE.locationAdminPage<=0?'disabled':''}>Anterior</button><button class="btn btn-outline btn-sm" data-action="loc-admin-page" data-step="1" ${STATE.locationAdminPage>=maxPage?'disabled':''}>Siguiente</button></div></div>`;
+}
+function locationStamp(iso){
+ if(!iso)return '—';const d=new Date(iso);return Number.isNaN(d.getTime())?String(iso):new Intl.DateTimeFormat('es-EC',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}).format(d);
+}
+function supervisorLocationsMarkup(){
+ const stamp=STORE.locationsSyncedAt?locationStamp(new Date(STORE.locationsSyncedAt).toISOString()):'Sin actualizar';
+ return `${header('Ubicaciones','',`<button class="btn btn-outline" data-action="loc-admin-refresh">${I('refresh')} Actualizar</button><button class="btn btn-primary" data-action="loc-admin-export">${I('download')} Excel</button>`)}
+ <div id="super-loc-stats">${locationAdminSummary()}</div>
+ <section class="surface pad"><div class="surface-head"><h2 class="surface-title">Asignaciones registradas</h2><span id="super-loc-sync" class="small muted">Consulta: ${escapeHtml(stamp)}</span></div>
+ <div class="loc-admin-filters"><div class="search-wrap">${I('search')}<input class="input" id="super-loc-search" value="${escapeHtml(STATE.locationAdminQuery)}" placeholder="Código, producto, ubicación o colaborador"></div><select class="input" id="super-loc-filter"><option value="assigned" ${STATE.locationAdminFilter==='assigned'?'selected':''}>Ubicados</option><option value="pending" ${STATE.locationAdminFilter==='pending'?'selected':''}>Sin ubicación</option><option value="all" ${STATE.locationAdminFilter==='all'?'selected':''}>Todos</option></select></div>
+ <div id="super-loc-table">${locationAdminTable()}</div></section>`;
+}
+function updateSupervisorLocationsView(){
+ const metrics=document.getElementById('super-loc-stats');if(metrics)metrics.innerHTML=locationAdminSummary();
+ const table=document.getElementById('super-loc-table');if(table)table.innerHTML=locationAdminTable();
+ const stamp=document.getElementById('super-loc-sync');if(stamp)stamp.textContent='Consulta: '+(STORE.locationsSyncedAt?locationStamp(new Date(STORE.locationsSyncedAt).toISOString()):'Sin actualizar');
+}
+function locationConsultResults(){
+ const query=String(STATE.locationConsultQuery||'').trim();
+ if(!query)return '<div class="empty">Busca un código, producto o ubicación.</div>';
+ if(!STORE.locationsLoaded)return '<div class="empty">Cargando ubicaciones…</div>';
+ const parts=norm(query).split(/\s+/).filter(Boolean);
+ const bySku=new Map(STORE.locations.map(x=>[x.skuId,x]));
+ const matches=STORE.products.filter(p=>{
+  const loc=bySku.get(p.id),hay=norm([p.name,p.code,loc?.location||''].join(' '));
+  return parts.every(w=>hay.includes(w));
+ }).sort((a,b)=>Number(Boolean(bySku.get(b.id)?.location))-Number(Boolean(bySku.get(a.id)?.location))||a.name.localeCompare(b.name)).slice(0,30);
+ return matches.map(p=>{
+  const loc=bySku.get(p.id),assigned=Boolean(loc?.location&&LOCATION_SET.has(loc.location));
+  return `<div class="loc-consult-row"><div><strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.code)}</small></div><span class="pill ${assigned?'green':''}">${assigned?escapeHtml(loc.location):'Sin ubicación'}</span></div>`;
+ }).join('')||'<div class="empty">No se encontraron productos.</div>';
+}
+function locationsConsultMarkup(){
+ return `<section class="surface pad loc-consult"><div class="surface-head"><h2 class="surface-title">Consultar ubicación</h2></div>
+ <div class="field"><label>Nombre, código o ubicación</label><div class="loc-consult-search">${I('search')}<input id="loc-consult-input" class="input" autocomplete="off" placeholder="Buscar producto o código" value="${escapeHtml(STATE.locationConsultQuery)}"></div><small>Datos: ${STORE.locationsSyncedAt?escapeHtml(locationStamp(new Date(STORE.locationsSyncedAt).toISOString())):'Cargando'} · Pulsa Actualizar para ver cambios recientes.</small></div>
+ <div id="loc-consult-results">${locationConsultResults()}</div></section>`;
+}
 function locationsWorkerMarkup(){
  const valid=new Set(STORE.products.map(p=>p.id));
  const recent=STORE.locations.filter(x=>valid.has(x.skuId)).slice().sort((a,b)=>String(b.updatedAt||'').localeCompare(String(a.updatedAt||''))).slice(0,8);
- return `<main class="loc-shell"><header class="loc-header">${logo()}<div class="toolbar">${badgeConnection()}<button class="btn btn-outline btn-sm" data-action="loc-refresh" title="Volver a consultar ubicaciones">${I('refresh')} Actualizar</button><button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header>
+ return `<main class="loc-shell"><header class="loc-header">${logo()}<div class="toolbar">${badgeConnection()}<button class="btn btn-outline btn-sm" data-action="loc-view-toggle" title="${STATE.locationView==='consult'?'Volver a asignar':'Consultar ubicaciones'}">${I(STATE.locationView==='consult'?'pin':'search')} ${STATE.locationView==='consult'?'Asignar':'Consultar'}</button><button class="btn btn-outline btn-sm" data-action="loc-refresh" title="Volver a consultar ubicaciones">${I('refresh')} Actualizar</button><button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header>
  <h1 class="loc-title">Mis Ubicaciones</h1><div class="loc-metrics" id="loc-metrics">${locationStatsMarkup()}</div>
- <div class="loc-grid"><section class="surface pad"><h2 class="surface-title">Buscar producto</h2><div class="field"><label>Nombre o código</label><input class="input" id="loc-search" placeholder="Nombre o código" value="${escapeHtml(STATE.locationQuery)}" autocomplete="off"></div><div id="loc-results" class="loc-search-results">${locationsSuggestions()}</div></section>
+ ${STATE.locationView==='consult'?locationsConsultMarkup():`<div class="loc-grid"><section class="surface pad"><h2 class="surface-title">Buscar producto</h2><div class="field"><label>Nombre o código</label><input class="input" id="loc-search" placeholder="Nombre o código" value="${escapeHtml(STATE.locationQuery)}" autocomplete="off"></div><div id="loc-results" class="loc-search-results">${locationsSuggestions()}</div></section>
  <section class="surface pad"><h2 class="surface-title">Asignar ubicación</h2><div id="loc-assignment">${locationAssignmentMarkup()}</div></section></div>
- <section class="surface pad loc-recent"><div class="surface-head"><h2 class="surface-title">Últimas asignaciones</h2></div><div id="loc-recent-list">${recent.map(x=>{let p=STORE.products.find(p=>p.id===x.skuId);return `<div class="loc-recent-row"><div class="loc-recent-product"><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · ${escapeHtml(x.name||'')}</small></div><div class="loc-recent-actions"><span class="pill green">${escapeHtml(x.location)}</span><button class="btn btn-outline btn-sm" type="button" data-action="loc-select-product" data-id="${escapeHtml(x.skuId)}" title="Editar ubicación">${I('edit')} Editar</button><button class="btn btn-danger btn-sm" type="button" data-action="loc-delete" data-id="${escapeHtml(x.skuId)}" title="Eliminar ubicación">${I('trash')} Eliminar</button></div></div>`}).join('')||'<div class="empty">Aún no hay ubicaciones asignadas.</div>'}</div></section></main>`;
+ <section class="surface pad loc-recent"><div class="surface-head"><h2 class="surface-title">Últimas asignaciones</h2></div><div id="loc-recent-list">${recent.map(x=>{let p=STORE.products.find(p=>p.id===x.skuId);return `<div class="loc-recent-row"><div class="loc-recent-product"><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · ${escapeHtml(x.name||'')}</small></div><div class="loc-recent-actions"><span class="pill green">${escapeHtml(x.location)}</span><button class="btn btn-outline btn-sm" type="button" data-action="loc-select-product" data-id="${escapeHtml(x.skuId)}" title="Editar ubicación">${I('edit')} Editar</button><button class="btn btn-danger btn-sm" type="button" data-action="loc-delete" data-id="${escapeHtml(x.skuId)}" title="Eliminar ubicación">${I('trash')} Eliminar</button></div></div>`}).join('')||'<div class="empty">Aún no hay ubicaciones asignadas.</div>'}</div></section>`}</main>`;
 }
 function locationRefreshResults(){const x=document.getElementById('loc-results');if(x)x.innerHTML=locationsSuggestions()}
 function locationRefreshForm(){const x=document.getElementById('loc-assignment');if(x)x.innerHTML=locationAssignmentMarkup()}
@@ -1467,10 +1551,11 @@ function pfSheetName(filename){
  if(f.includes('conteo'))return 'Conteos';
  if(f.includes('sobrante'))return 'Fuera de stock';
  if(f.includes('factura'))return 'Propuesta facturas';
+ if(f.includes('ubicaciones'))return 'Ubicaciones';
  if(f.includes('inventario'))return 'Inventario';
  return 'Status - Novedades';
 }
-const PF_XLSX_HEADERS={codigo:'Código',producto:'Producto',categoria:'Categoría',presentacion:'Presentación',teorico:'Teórico',fisicoVigente:'Físico vigente',conteoInicial:'Conteo inicial',reconteo:'Reconteo',diferencia:'Diferencia',estado:'Estado',colaborador:'Colaborador',posicion:'Posición',cantidad:'Cantidad',unidades:'Unidades',caducidad:'Caducidad',registro:'Fecha de registro',fechaRegistro:'Fecha de registro',modificado:'Última modificación',origen:'Origen',costoTotal:'Costo total',presentaciones:'Presentaciones',unidadesPorPresentacion:'Unidades por presentación',totalUnidades:'Total unidades',destino:'Destino',skuActual:'SKU actual',precioFactura:'Precio factura',factorValidado:'Factor validado',skuVinculado:'SKU vinculado',registros:'Registros'};
+const PF_XLSX_HEADERS={ubicacion:'Ubicación',codigo:'Código',producto:'Producto',categoria:'Categoría',presentacion:'Presentación',teorico:'Teórico',fisicoVigente:'Físico vigente',conteoInicial:'Conteo inicial',reconteo:'Reconteo',diferencia:'Diferencia',estado:'Estado',colaborador:'Colaborador',posicion:'Posición',cantidad:'Cantidad',unidades:'Unidades',caducidad:'Caducidad',registro:'Fecha de registro',fechaRegistro:'Fecha de registro',modificado:'Última modificación',origen:'Origen',costoTotal:'Costo total',presentaciones:'Presentaciones',unidadesPorPresentacion:'Unidades por presentación',totalUnidades:'Total unidades',destino:'Destino',skuActual:'SKU actual',precioFactura:'Precio factura',factorValidado:'Factor validado',skuVinculado:'SKU vinculado',registros:'Registros'};
 async function exportXlsx(rows,filename){
  if(!rows.length){notify('No hay registros para exportar.','error');return;}
  const XLSX=await pfEnsureXlsx();
@@ -1503,8 +1588,8 @@ function prepareSound(){try{const AC=window.AudioContext||window.webkitAudioCont
 function beep(){try{const ctx=prepareSound();if(!ctx)return;const t=ctx.currentTime+.018;for(const [freq,offset] of [[720,0],[1030,.115]]){let osc=ctx.createOscillator(),gain=ctx.createGain();osc.type='sine';osc.frequency.value=freq;gain.gain.setValueAtTime(.0001,t+offset);gain.gain.exponentialRampToValueAtTime(.16,t+offset+.012);gain.gain.exponentialRampToValueAtTime(.0001,t+offset+.10);osc.connect(gain);gain.connect(ctx.destination);osc.start(t+offset);osc.stop(t+offset+.11)}navigator.vibrate?.(60)}catch(e){console.warn('El dispositivo no permitió emitir sonido',e)}}
 
 const refreshTable=debounce(updateTables,120);
-document.addEventListener('input',e=>{if(e.target.id==='dashboard-search'){STATE.query=e.target.value;STATE.page=0;refreshTable()}if(e.target.id==='inventory-search'){STATE.invQuery=e.target.value;STATE.invPage=0;refreshTable()}if(e.target.id==='expiry-search'){STATE.expiryQuery=e.target.value;refreshTable()}if(['worker-qty','box-factor'].includes(e.target.id))updateUnitControls();if(['unit-review-packs','unit-review-factor'].includes(e.target.id)){const packs=Number(document.getElementById('unit-review-packs')?.value),factor=Number(document.getElementById('unit-review-factor')?.value),preview=document.getElementById('unit-review-preview');if(preview&&Number.isSafeInteger(packs)&&Number.isSafeInteger(factor)&&packs>0&&factor>0)preview.innerHTML=`Teórico propuesto: <b>${nfmt(packs*factor)} unidades</b> (${nfmt(packs)} × ${nfmt(factor)}). Revisa antes de confirmar.`;}if(e.target.id==='loc-search'){STATE.locationQuery=e.target.value;STATE.locationSkuId=null;STATE.locationCode='';locationRefreshResults();locationRefreshForm()}if(e.target.id==='loc-code'){STATE.locationCode=e.target.value.toUpperCase().replace(/\s/g,'');const el=document.getElementById('loc-options');if(el)el.innerHTML=locationCodeSuggestions()}if(e.target.id==='worker-search'){STATE.workerQuery=e.target.value;STATE.selected=null;updateSuggestions()}if(e.target.id==='worker-expiry'){let el=document.getElementById('expiry-preview');let normalized=expiryInput(e.target.value);if(el)el.textContent=normalized?formatDate(normalized):e.target.value?'Usa 4 números: MMAA (ej. 0826)':'Ej. 0826 = Agosto/2026'}});
-document.addEventListener('change',e=>{if(e.target.matches('[data-invoice-factor]')){invoiceEditFactor(e.target.dataset.invoiceFactor,e.target.value);return;}if(e.target.matches('[data-invoice-qty]')){invoiceEditQuantity(e.target.dataset.invoiceQty,e.target.value);return;}if(e.target.matches('[data-invoice-target]')){invoiceChooseTarget(e.target.dataset.invoiceTarget,e.target.value);return;}if(e.target.id==='invoice-filter'){INVOICE_REVIEW.filter=e.target.value;invoiceRenderReview();return;}if(e.target.id==='invoice-confirm'){INVOICE_REVIEW.confirmed=e.target.checked;invoiceRefreshControls();return;}if(e.target.id==='invoice-backup-ready'){INVOICE_REVIEW.backedUp=e.target.checked;invoiceRefreshControls();return;}if(e.target.matches('[data-invoice-link-check]')){invoiceToggleLink(e.target.dataset.invoiceLinkCheck,e.target.checked);return;}
+document.addEventListener('input',e=>{if(e.target.id==='dashboard-search'){STATE.query=e.target.value;STATE.page=0;refreshTable()}if(e.target.id==='inventory-search'){STATE.invQuery=e.target.value;STATE.invPage=0;refreshTable()}if(e.target.id==='expiry-search'){STATE.expiryQuery=e.target.value;refreshTable()}if(['worker-qty','box-factor'].includes(e.target.id))updateUnitControls();if(['unit-review-packs','unit-review-factor'].includes(e.target.id)){const packs=Number(document.getElementById('unit-review-packs')?.value),factor=Number(document.getElementById('unit-review-factor')?.value),preview=document.getElementById('unit-review-preview');if(preview&&Number.isSafeInteger(packs)&&Number.isSafeInteger(factor)&&packs>0&&factor>0)preview.innerHTML=`Teórico propuesto: <b>${nfmt(packs*factor)} unidades</b> (${nfmt(packs)} × ${nfmt(factor)}). Revisa antes de confirmar.`;}if(e.target.id==='super-loc-search'){STATE.locationAdminQuery=e.target.value;STATE.locationAdminPage=0;updateSupervisorLocationsView()}if(e.target.id==='loc-consult-input'){STATE.locationConsultQuery=e.target.value;const box=document.getElementById('loc-consult-results');if(box)box.innerHTML=locationConsultResults()}if(e.target.id==='loc-search'){STATE.locationQuery=e.target.value;STATE.locationSkuId=null;STATE.locationCode='';locationRefreshResults();locationRefreshForm()}if(e.target.id==='loc-code'){STATE.locationCode=e.target.value.toUpperCase().replace(/\s/g,'');const el=document.getElementById('loc-options');if(el)el.innerHTML=locationCodeSuggestions()}if(e.target.id==='worker-search'){STATE.workerQuery=e.target.value;STATE.selected=null;updateSuggestions()}if(e.target.id==='worker-expiry'){let el=document.getElementById('expiry-preview');let normalized=expiryInput(e.target.value);if(el)el.textContent=normalized?formatDate(normalized):e.target.value?'Usa 4 números: MMAA (ej. 0826)':'Ej. 0826 = Agosto/2026'}});
+document.addEventListener('change',e=>{if(e.target.matches('[data-invoice-factor]')){invoiceEditFactor(e.target.dataset.invoiceFactor,e.target.value);return;}if(e.target.matches('[data-invoice-qty]')){invoiceEditQuantity(e.target.dataset.invoiceQty,e.target.value);return;}if(e.target.matches('[data-invoice-target]')){invoiceChooseTarget(e.target.dataset.invoiceTarget,e.target.value);return;}if(e.target.id==='super-loc-filter'){STATE.locationAdminFilter=e.target.value;STATE.locationAdminPage=0;updateSupervisorLocationsView();return;}if(e.target.id==='invoice-filter'){INVOICE_REVIEW.filter=e.target.value;invoiceRenderReview();return;}if(e.target.id==='invoice-confirm'){INVOICE_REVIEW.confirmed=e.target.checked;invoiceRefreshControls();return;}if(e.target.id==='invoice-backup-ready'){INVOICE_REVIEW.backedUp=e.target.checked;invoiceRefreshControls();return;}if(e.target.matches('[data-invoice-link-check]')){invoiceToggleLink(e.target.dataset.invoiceLinkCheck,e.target.checked);return;}
 if(e.target.id==='select-all-novelties'){
   const queued=new Set(STORE.recounts.map(t=>t.skuId));
   const eligible=selectedFiltered().filter(p=>(p.status==='missing'||p.status==='extra'||p.status==='pending')&&!queued.has(p.id));
@@ -1512,7 +1597,22 @@ if(e.target.id==='select-all-novelties'){
   document.querySelectorAll('input[data-action="select-novelty"]').forEach(box=>{box.checked=STATE.recountSelection.has(box.dataset.id)});
  }if(e.target.id==='count-mode')updateUnitControls();if(e.target.id==='dashboard-status'){STATE.status=e.target.value;STATE.page=0;updateTables()}if(e.target.id==='expiry-range'){STATE.expiryRange=e.target.value;updateTables()}});
 document.addEventListener('click',async e=>{let b=e.target.closest('[data-action]');if(!b)return;let action=b.dataset.action,id=b.dataset.id;try{
- if(action==='loc-select-product'){
+ if(action==='loc-view-toggle'){
+   if(STORE.role!=='locations')throw Error('Solo disponible en Ubicaciones.');
+   STATE.locationView=STATE.locationView==='consult'?'assign':'consult';render();
+   document.getElementById(STATE.locationView==='consult'?'loc-consult-input':'loc-search')?.focus({preventScroll:true});
+ }else if(action==='loc-admin-refresh'){
+   if(STORE.role!=='supervisor')throw Error('Solo Supervisión.');
+   if(STORE.appMode==='firebase'&&STORE.locationsLoaded&&locationRemoteFetchedAt&&Date.now()-locationRemoteFetchedAt<LOCATIONS_REFRESH_GAP_MS){notify('Consulta reciente. Espera unos segundos para actualizar nuevamente.');return;}
+   if(STORE.appMode==='firebase')await adapter.loadLocations(true);else await adapter.loadLocations();
+   updateSupervisorLocationsView();notify('Panel de ubicaciones actualizado.');
+ }else if(action==='loc-admin-export'){
+   if(STORE.role!=='supervisor'||!STORE.locationsLoaded)throw Error('Carga primero las ubicaciones.');
+   await exportXlsx(locationAdminRows().map(({p,loc})=>({codigo:p.code,producto:p.name,ubicacion:loc?.location||'',colaborador:loc?.name||'',modificado:loc?.updatedAt||''})),`puntofarma_ubicaciones_${localToday()}.xlsx`);
+ }else if(action==='loc-admin-page'){
+   if(STORE.role!=='supervisor')throw Error('Solo Supervisión.');
+   STATE.locationAdminPage=Math.max(0,STATE.locationAdminPage+Number(b.dataset.step||0));updateSupervisorLocationsView();
+ }else if(action==='loc-select-product'){
    if(STORE.role!=='locations')throw Error('Ingresa por Ubicaciones.');
    STATE.locationSkuId=id;STATE.locationCode=STORE.locations.find(x=>x.skuId===id)?.location||'';
    locationRefreshResults();locationRefreshForm();
@@ -1539,6 +1639,7 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    }finally{STATE.locationBusy=false}
  }else if(action==='loc-refresh'){
    if(STORE.role!=='locations')throw Error('Acción exclusiva de Ubicaciones.');
+   if(STORE.appMode==='firebase'&&STORE.locationsLoaded&&locationRemoteFetchedAt&&Date.now()-locationRemoteFetchedAt<LOCATIONS_REFRESH_GAP_MS){notify('Consulta reciente. Espera unos segundos para actualizar nuevamente.');return;}
    if(STORE.appMode==='firebase')await adapter.loadLocations(true);else await adapter.loadLocations();
    render();notify('Ubicaciones actualizadas.');
  }else if(action==='delete-recount-entry'){
@@ -1632,7 +1733,7 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    await navigator.clipboard.writeText(data);notify(`${rows.length} filas copiadas.`);
  }else if(action==='download-filter'){
    await exportXlsx(filteredRowsCSV(),`puntofarma_${STATE.status}_${localToday()}.xlsx`);
- }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;if(STORE.appMode==='firebase'&&STORE.role==='supervisor'&&refreshSupervisorFeeds)refreshSupervisorFeeds(STATE.panel);render()}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
+ }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;if(STORE.appMode==='firebase'&&STORE.role==='supervisor'&&refreshSupervisorFeeds)refreshSupervisorFeeds(STATE.panel);render();if(STATE.panel==='locations'&&!STATE.locationSupervisorRequested){STATE.locationSupervisorRequested=true;adapter.loadLocations(STORE.appMode==='firebase').catch(err=>{console.error('Ubicaciones / supervisión',err);notify('No se pudieron cargar ubicaciones: '+String(err.message||err),'error')});}}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
  else if(action==='review-units'){showUnitReview(id)}else if(action==='keep-theory'){const p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto no encontrado.');if(!confirm('¿Confirmas que el teórico actual está expresado en unidades y NO debe multiplicarse? Se mantendrá la diferencia física.'))return;await adapter.updateProduct(id,{unitReviewResolved:true});closeModal();notify('Confirmado: teórico conservado como unidades.');if(STORE.appMode==='demo')render()}else if(action==='edit-product'){showProductEditor(id)}else if(action==='new-product'){showProductEditor(null)}else if(action==='delete-product'){let p=STORE.products.find(x=>x.id===id);if(!confirm(`¿Eliminar ${p?.name||'este producto'} del catálogo? También se retirará de Reconteo si está enviado. Los conteos históricos se conservarán.`))return;await adapter.deleteProduct(id);notify('Producto eliminado del catálogo y retirado de Reconteo.');if(STORE.appMode==='demo')render()}
  else if(action==='update-theory'){invoiceUpdateModal()}else if(action==='reconcile-existing-surplus'){INVOICE_REVIEW={items:[],applied:true,links:[]};invoiceReconcileModal()}else if(action==='invoice-suggested'){invoiceBulkSuggested()}else if(action==='invoice-assume-units'){invoiceBulkSingle()}else if(action==='invoice-backup'){invoiceBackup()}else if(action==='invoice-preview-export'){await invoiceExportPreview()}else if(action==='invoice-link-review'){invoiceRenderLinks()}else if(action==='invoice-link-toggle'){invoiceToggleLink(id,b.checked)}else if(action==='invoice-link-all'){invoiceSelectSafeLinks()}else if(action==='invoice-link-none'){invoiceClearLinks()}else if(action==='invoice-manual-link'){invoiceManualLinkModal(id)}else if(action==='invoice-previous'){INVOICE_REVIEW.current=Math.max(0,INVOICE_REVIEW.current-1);invoiceRenderReview()}else if(action==='invoice-next'){INVOICE_REVIEW.current++;invoiceRenderReview()}else if(action==='import-modal'){importModal()}else if(action==='reset-modal'){resetModal(b.dataset.mode)}else if(action==='new-admin'){modalNewAdmin()}else if(action==='change-pass'){modalPassword(id)}else if(action==='toggle-user'){if(!confirm('¿Cambiar el estado de este acceso?'))return;await adapter.toggleUser(id);notify('Estado actualizado.');if(STORE.appMode==='demo')render()}
  else if(action==='export-surplus'){await exportXlsx(surplusCSV(),'puntofarma_sobrantes_manuales.xlsx')}else if(action==='export-counts'){await exportXlsx(countCSV(),'puntofarma_conteos.xlsx')}else if(action==='export-expiry'){await exportXlsx([...STORE.counts.map(c=>{const p=STORE.products.find(x=>x.id===c.skuId);return {codigo:p?.code||'',producto:p?.name||'',colaborador:c.name,posicion:c.position,cantidad:c.qty,caducidad:formatDate(c.expiry),registro:c.createdAt||'',origen:'Conteo físico'}}).filter(x=>x.caducidad),...surplusCSV()],'puntofarma_caducidades.xlsx')}else if(action==='export-inventory'){await exportXlsx(STORE.products.map(p=>({codigo:p.code,producto:p.name,categoria:p.category,presentacion:p.presentation,teorico:p.theoretical,costoTotal:p.costTotal})),'puntofarma_inventario.xlsx')}
