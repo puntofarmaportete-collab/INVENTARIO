@@ -45,7 +45,7 @@
 .loc-current{background:#f3faff;border:1px solid #bfe3f2;border-radius:10px;padding:12px;font-size:12px;color:#4c7f96}
 .loc-current strong{font-size:15px;color:#126f95}
 .loc-recent{margin-top:16px}.loc-recent-row{border-bottom:1px solid #edf2f6;padding:11px 0;display:flex;justify-content:space-between;gap:12px;align-items:center}
-.loc-recent-row strong{font-size:12px;display:block}.loc-recent-row small{color:var(--muted);font-size:11px}
+.loc-recent-row strong{font-size:12px;display:block}.loc-recent-row small{color:var(--muted);font-size:11px}.loc-recent-product{min-width:0;flex:1;overflow-wrap:anywhere}.loc-recent-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.loc-recent-actions .btn{white-space:nowrap}.loc-form-actions{display:grid;grid-template-columns:1fr auto;gap:9px;margin-top:6px}.loc-form-actions .btn{min-height:42px}@media(max-width:480px){.loc-recent-row{align-items:flex-start;flex-direction:column}.loc-recent-actions{justify-content:flex-start}.loc-form-actions{grid-template-columns:1fr 1fr}}
 .loc-shell input{font-size:16px!important}.loc-instructions{font-size:12px;color:var(--muted);margin:4px 0 15px;line-height:1.5}
 @media(max-width:700px){.loc-shell{padding:12px 12px 45px}.loc-grid{grid-template-columns:1fr}.loc-title{font-size:22px}.loc-header .logo-img{width:146px}.loc-metrics{gap:6px}}
 /* PuntoFarma · mejoras para celulares, conteo sin saltos de teclado */
@@ -339,6 +339,7 @@ const demoAdapter={
  async resetData(mode){if(mode==='catalog'&&STORE.counts.length)throw Error('Borra primero los conteos.');if(mode==='counts'||mode==='all'){STORE.counts=[];STORE.surplus=[];STORE.recounts=[];STORE.recountEntries=[];}if(mode==='catalog'||mode==='all')STORE.products=[];syncLocal()},
  async loadLocations(){STORE.locations=loadDemo('locations',[]);STORE.locationsLoaded=true;scheduleRender()},
  async saveLocation(skuId,location,expected){const old=STORE.locations.find(x=>x.skuId===skuId)||null;if((old?.updatedAt||'')!==(expected||''))throw Error('La ubicación cambió. Pulsa Actualizar y vuelve a intentar.');const doc={skuId,location,uid:STORE.uid,name:STORE.user.displayName,updatedAt:now()};STORE.locations=STORE.locations.filter(x=>x.skuId!==skuId).concat(doc);syncLocal();return doc},
+ async deleteLocation(skuId,expected){const old=STORE.locations.find(x=>x.skuId===skuId);if(!old)throw Error('Este producto ya no tiene ubicación. Pulsa Actualizar.');if(String(old.updatedAt||'')!==String(expected||''))throw Error('Otro colaborador cambió esta ubicación. Pulsa Actualizar.');STORE.locations=STORE.locations.filter(x=>x.skuId!==skuId);syncLocal();},
  async start(){return true},async signOut(){}
 };
 let fb=null;
@@ -590,6 +591,17 @@ const firebaseAdapter={
   STORE.locations=STORE.locations.filter(x=>x.skuId!==skuId).concat(result);
   writeCache('locations',{rows:STORE.locations,at:Date.now()});
   return result;
+ },
+ async deleteLocation(skuId,expectedUpdatedAt){
+  const {fsm,db}=fb,ref=fsm.doc(db,'locations',skuId);
+  await fsm.runTransaction(db,async tx=>{
+   const snap=await tx.get(ref);
+   if(!snap.exists())throw Error('Esta ubicación ya fue eliminada. Pulsa Actualizar.');
+   if(String(snap.data().updatedAt||'')!==String(expectedUpdatedAt||''))throw Error('Otro colaborador modificó esta ubicación. Pulsa Actualizar antes de eliminar.');
+   tx.delete(ref);
+  });
+  STORE.locations=STORE.locations.filter(x=>x.skuId!==skuId);
+  writeCache('locations',{rows:STORE.locations,at:Date.now()});
  },
  async start(role,uid){
   const {fsm,db}=fb;
@@ -1164,7 +1176,7 @@ function locationAssignmentMarkup(){
  if(!p)return '<div class="empty">Selecciona un producto para asignar su ubicación.</div>';
  const current=STORE.locations.find(x=>x.skuId===p.id);
  return `<div class="field"><label>Producto seleccionado</label><div class="loc-current"><strong>${escapeHtml(p.name)}</strong><div>${escapeHtml(p.code)}</div><div style="margin-top:7px">Actual: <strong>${escapeHtml(current?.location||'Sin asignar')}</strong>${current?.name?` · ${escapeHtml(current.name)}`:''}</div></div></div>
- <form data-form="location-save" class="form-stack" style="margin-top:13px"><input type="hidden" name="skuId" value="${escapeHtml(p.id)}"><div class="field"><label>Ubicación *</label><input id="loc-code" name="location" class="input" placeholder="Ej. V1-N2" autocomplete="off" autocapitalize="characters" value="${escapeHtml(STATE.locationCode)}" required></div><div class="loc-location-options" id="loc-options">${locationCodeSuggestions()}</div><button class="btn btn-primary btn-block" type="submit" ${!STORE.locationsLoaded?'disabled':''}>${I('check')} Guardar ubicación</button></form>`;
+ <form data-form="location-save" class="form-stack" style="margin-top:13px"><input type="hidden" name="skuId" value="${escapeHtml(p.id)}"><div class="field"><label>Ubicación *</label><input id="loc-code" name="location" class="input" placeholder="Ej. V1-N2" autocomplete="off" autocapitalize="characters" value="${escapeHtml(STATE.locationCode)}" required></div><div class="loc-location-options" id="loc-options">${locationCodeSuggestions()}</div><div class="loc-form-actions"><button class="btn btn-primary" type="submit" ${!STORE.locationsLoaded?'disabled':''}>${I('check')} Guardar ubicación</button>${current?.location?`<button type="button" class="btn btn-danger" data-action="loc-delete" data-id="${escapeHtml(p.id)}" ${!STORE.locationsLoaded?'disabled':''}>${I('trash')} Eliminar</button>`:''}</div></form>`;
 }
 function locationStatsMarkup(){
  const valid=new Set(STORE.products.map(p=>p.id));const assigned=STORE.locations.filter(x=>valid.has(x.skuId)&&LOCATION_SET.has(x.location));
@@ -1177,7 +1189,7 @@ function locationsWorkerMarkup(){
  <h1 class="loc-title">Mis Ubicaciones</h1><div class="loc-metrics" id="loc-metrics">${locationStatsMarkup()}</div>
  <div class="loc-grid"><section class="surface pad"><h2 class="surface-title">Buscar producto</h2><div class="field"><label>Nombre o código</label><input class="input" id="loc-search" placeholder="Nombre o código" value="${escapeHtml(STATE.locationQuery)}" autocomplete="off"></div><div id="loc-results" class="loc-search-results">${locationsSuggestions()}</div></section>
  <section class="surface pad"><h2 class="surface-title">Asignar ubicación</h2><div id="loc-assignment">${locationAssignmentMarkup()}</div></section></div>
- <section class="surface pad loc-recent"><div class="surface-head"><h2 class="surface-title">Últimas asignaciones</h2></div><div id="loc-recent-list">${recent.map(x=>{let p=STORE.products.find(p=>p.id===x.skuId);return `<div class="loc-recent-row"><div><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · ${escapeHtml(x.name||'')}</small></div><span class="pill green">${escapeHtml(x.location)}</span></div>`}).join('')||'<div class="empty">Aún no hay ubicaciones asignadas.</div>'}</div></section></main>`;
+ <section class="surface pad loc-recent"><div class="surface-head"><h2 class="surface-title">Últimas asignaciones</h2></div><div id="loc-recent-list">${recent.map(x=>{let p=STORE.products.find(p=>p.id===x.skuId);return `<div class="loc-recent-row"><div class="loc-recent-product"><strong>${escapeHtml(p?.name||'Producto')}</strong><small>${escapeHtml(p?.code||'')} · ${escapeHtml(x.name||'')}</small></div><div class="loc-recent-actions"><span class="pill green">${escapeHtml(x.location)}</span><button class="btn btn-outline btn-sm" type="button" data-action="loc-select-product" data-id="${escapeHtml(x.skuId)}" title="Editar ubicación">${I('edit')} Editar</button><button class="btn btn-danger btn-sm" type="button" data-action="loc-delete" data-id="${escapeHtml(x.skuId)}" title="Eliminar ubicación">${I('trash')} Eliminar</button></div></div>`}).join('')||'<div class="empty">Aún no hay ubicaciones asignadas.</div>'}</div></section></main>`;
 }
 function locationRefreshResults(){const x=document.getElementById('loc-results');if(x)x.innerHTML=locationsSuggestions()}
 function locationRefreshForm(){const x=document.getElementById('loc-assignment');if(x)x.innerHTML=locationAssignmentMarkup()}
@@ -1510,6 +1522,21 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    STATE.locationCode=b.dataset.code;
    const field=document.getElementById('loc-code');if(field)field.value=STATE.locationCode;
    const options=document.getElementById('loc-options');if(options)options.innerHTML=locationCodeSuggestions();
+ }else if(action==='loc-delete'){
+   if(STORE.role!=='locations')throw Error('Ingresa desde Ubicaciones.');
+   if(!STORE.locationsLoaded)throw Error('Espera a que se carguen las ubicaciones.');
+   if(STATE.locationBusy)return;
+   const previous=STORE.locations.find(x=>x.skuId===id);
+   if(!previous?.location)throw Error('El producto ya no tiene ubicación. Pulsa Actualizar.');
+   const product=STORE.products.find(p=>p.id===id);
+   if(!product)throw Error('El producto ya no existe en el catálogo.');
+   if(!confirm(`¿Eliminar la ubicación ${previous.location} de ${product.name}?\n\nEl producto y su inventario NO se eliminarán.`))return;
+   STATE.locationBusy=true;
+   try{
+     await adapter.deleteLocation(id,previous.updatedAt||'');
+     if(STATE.locationSkuId===id)STATE.locationCode='';
+     render();notify('Ubicación eliminada. El producto continúa en el inventario.');
+   }finally{STATE.locationBusy=false}
  }else if(action==='loc-refresh'){
    if(STORE.role!=='locations')throw Error('Acción exclusiva de Ubicaciones.');
    if(STORE.appMode==='firebase')await adapter.loadLocations(true);else await adapter.loadLocations();
