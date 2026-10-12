@@ -46,7 +46,7 @@
 .loc-current strong{font-size:15px;color:#126f95}
 .loc-recent{margin-top:16px}.loc-recent-row{border-bottom:1px solid #edf2f6;padding:11px 0;display:flex;justify-content:space-between;gap:12px;align-items:center}
 .loc-recent-row strong{font-size:12px;display:block}.loc-recent-row small{color:var(--muted);font-size:11px}.loc-recent-product{min-width:0;flex:1;overflow-wrap:anywhere}.loc-recent-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.loc-recent-actions .btn{white-space:nowrap}.loc-form-actions{display:grid;grid-template-columns:1fr auto;gap:9px;margin-top:6px}.loc-form-actions .btn{min-height:42px}@media(max-width:480px){.loc-recent-row{align-items:flex-start;flex-direction:column}.loc-recent-actions{justify-content:flex-start}.loc-form-actions{grid-template-columns:1fr 1fr}}
-.loc-consult{max-width:780px;margin:0 auto}.loc-consult-search{position:relative}.loc-consult-search>svg{position:absolute;left:14px;top:13px;color:#718fa2}.loc-consult-search input{padding-left:42px}.loc-consult-row{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 8px;border-bottom:1px solid var(--line)}.loc-consult-row:last-child{border-bottom:0}.loc-consult-row strong,.loc-consult-row small{display:block}.loc-consult-row strong{font-size:13px;overflow-wrap:anywhere}.loc-consult-row small{font-size:11px;color:var(--muted);margin-top:3px}.loc-consult-row .pill{flex-shrink:0}.loc-admin-filters{display:grid;grid-template-columns:minmax(0,1fr) 165px;gap:11px;margin:15px 0}.loc-admin-filters .search-wrap{margin:0}.loc-admin-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px}.loc-admin-footer .toolbar{display:flex;gap:8px}@media(max-width:680px){.loc-admin-filters{grid-template-columns:1fr}.loc-admin-footer{align-items:flex-start;flex-direction:column}.loc-header .toolbar{gap:5px}.loc-header .toolbar .btn-sm{padding:7px 9px;font-size:11px}}
+.loc-consult{max-width:780px;margin:0 auto}.loc-consult-search{position:relative}.loc-consult-search>svg{position:absolute;left:14px;top:13px;color:#718fa2}.loc-consult-search input{padding-left:42px}.loc-consult-row{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 8px;border-bottom:1px solid var(--line)}.loc-consult-row:last-child{border-bottom:0}.loc-consult-row strong,.loc-consult-row small{display:block}.loc-consult-row strong{font-size:13px;overflow-wrap:anywhere}.loc-consult-row small{font-size:11px;color:var(--muted);margin-top:3px}.loc-consult-row .pill{flex-shrink:0}.loc-admin-filters{display:grid;grid-template-columns:minmax(0,1fr) 165px;gap:11px;margin:15px 0}.loc-admin-actions{display:flex;gap:6px;justify-content:flex-end;align-items:center;white-space:nowrap}.loc-admin-actions .btn{padding:7px 9px;min-height:32px}.loc-admin-code-options{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.loc-admin-code-options button{border:1px solid #d5e8f0;border-radius:9px;background:#f3faff;color:#166487;padding:8px 10px;font-weight:700}.loc-admin-code-options button:hover{border-color:#00aae8;background:#e2f6ff}.loc-admin-filters .search-wrap{margin:0}.loc-admin-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px}.loc-admin-footer .toolbar{display:flex;gap:8px}@media(max-width:680px){.loc-admin-filters{grid-template-columns:1fr}.loc-admin-footer{align-items:flex-start;flex-direction:column}.loc-header .toolbar{gap:5px}.loc-header .toolbar .btn-sm{padding:7px 9px;font-size:11px}}
 .loc-shell input{font-size:16px!important}.loc-instructions{font-size:12px;color:var(--muted);margin:4px 0 15px;line-height:1.5}
 @media(max-width:700px){.loc-shell{padding:12px 12px 45px}.loc-grid{grid-template-columns:1fr}.loc-title{font-size:22px}.loc-header .logo-img{width:146px}.loc-metrics{gap:6px}}
 /* PuntoFarma · mejoras para celulares, conteo sin saltos de teclado */
@@ -274,6 +274,22 @@ const LOCATIONS_REFRESH_GAP_MS=30*1000;
 let locationRemoteFetchedAt=0,locationLoadPending=null;
 const LOCATION_CODES=[...[1,3,4,6,8,9,10,11].flatMap(t=>Array.from({length:5},(_,n)=>`T${t}-N${n+1}`)),...[1,2,3,4,5].flatMap(v=>Array.from({length:4},(_,n)=>`V${v}-N${n+1}`)),...[1,2,3].flatMap(p=>Array.from({length:6},(_,n)=>`P${p}-N${n+1}`))];
 const LOCATION_SET=new Set(LOCATION_CODES);
+// Las ubicaciones del plano se sugieren, pero se admiten nuevos niveles escritos
+// manualmente (por ejemplo T5-N1 o T7-N8) sin alterar el mapa base ni Firestore.
+const MANUAL_LOCATION_RE=/^[TVP][1-9][0-9]{0,2}-N[1-9][0-9]{0,2}$/;
+function validLocationCode(value){return MANUAL_LOCATION_RE.test(String(value||'').trim().toUpperCase());}
+function locationSuggestionsFor(value,limit=12){
+ const input=String(value||'').trim().toUpperCase().replace(/\s/g,'');
+ const known=LOCATION_CODES.filter(code=>!input||code.startsWith(input));
+ // Si una torre, vitrina o percha no está en el plano inicial, sus niveles
+ // se sugieren en el propio navegador; jamás se consultan a Firebase.
+ const part=input.match(/^([TVP][1-9][0-9]{0,2})(?:-N([0-9]{0,3})?)?$/);
+ if(part){
+  const prefix=part[1],levels=Array.from({length:10},(_,n)=>`${prefix}-N${n+1}`);
+  for(const code of levels)if(code.startsWith(input)&&!known.includes(code))known.push(code);
+ }
+ return known.slice(0,limit);
+}
 function readCache(key){try{return JSON.parse(localStorage.getItem(CACHE_NS+key)||'null')}catch{return null}}
 function writeCache(key,value){try{localStorage.setItem(CACHE_NS+key,JSON.stringify(value))}catch(e){console.warn('Caché local no disponible',e)}}
 const sheetNames={dashboard:'Control de inventario',inventory:'Mi inventario',locations:'Ubicaciones',expiry:'Caducidades',users:'Configuración'};
@@ -1188,18 +1204,20 @@ function locationsSuggestions(){
 }
 function locationCodeSuggestions(){
  const filter=String(STATE.locationCode||'').toUpperCase().replace(/\s/g,'');
- const all=LOCATION_CODES.filter(code=>!filter||code.startsWith(filter));
- return all.slice(0,12).map(code=>`<button type="button" data-action="loc-choose-code" data-code="${escapeHtml(code)}" class="${STATE.locationCode===code?'active':''}">${code}</button>`).join('') || '<span class="small muted">No existe esa ubicación. Usa T, V o P y el nivel.</span>';
+ const all=locationSuggestionsFor(filter,12);
+ const buttons=all.map(code=>`<button type="button" data-action="loc-choose-code" data-code="${escapeHtml(code)}" class="${STATE.locationCode===code?'active':''}">${escapeHtml(code)}</button>`).join('');
+ if(filter&&validLocationCode(filter)&&!LOCATION_SET.has(filter))return buttons+`<span class="small muted">Ubicación manual: ${escapeHtml(filter)} · Puedes guardarla.</span>`;
+ return buttons || '<span class="small muted">Escribe una ubicación, por ejemplo T5-N1.</span>';
 }
 function locationAssignmentMarkup(){
  const p=STORE.products.find(x=>x.id===STATE.locationSkuId);
  if(!p)return '<div class="empty">Selecciona un producto para asignar su ubicación.</div>';
  const current=STORE.locations.find(x=>x.skuId===p.id);
  return `<div class="field"><label>Producto seleccionado</label><div class="loc-current"><strong>${escapeHtml(p.name)}</strong><div>${escapeHtml(p.code)}</div><div style="margin-top:7px">Actual: <strong>${escapeHtml(current?.location||'Sin asignar')}</strong>${current?.name?` · ${escapeHtml(current.name)}`:''}</div></div></div>
- <form data-form="location-save" class="form-stack" style="margin-top:13px"><input type="hidden" name="skuId" value="${escapeHtml(p.id)}"><div class="field"><label>Ubicación *</label><input id="loc-code" name="location" class="input" placeholder="Ej. V1-N2" autocomplete="off" autocapitalize="characters" value="${escapeHtml(STATE.locationCode)}" required></div><div class="loc-location-options" id="loc-options">${locationCodeSuggestions()}</div><div class="loc-form-actions"><button class="btn btn-primary" type="submit" ${!STORE.locationsLoaded?'disabled':''}>${I('check')} Guardar ubicación</button>${current?.location?`<button type="button" class="btn btn-danger" data-action="loc-delete" data-id="${escapeHtml(p.id)}" ${!STORE.locationsLoaded?'disabled':''}>${I('trash')} Eliminar</button>`:''}</div></form>`;
+ <form data-form="location-save" class="form-stack" style="margin-top:13px"><input type="hidden" name="skuId" value="${escapeHtml(p.id)}"><div class="field"><label>Ubicación *</label><input id="loc-code" name="location" class="input" placeholder="Ej. T5-N1, T7-N2 o V1-N2" autocomplete="off" autocapitalize="characters" value="${escapeHtml(STATE.locationCode)}" required></div><div class="loc-location-options" id="loc-options">${locationCodeSuggestions()}</div><div class="loc-form-actions"><button class="btn btn-primary" type="submit" ${!STORE.locationsLoaded?'disabled':''}>${I('check')} Guardar ubicación</button>${current?.location?`<button type="button" class="btn btn-danger" data-action="loc-delete" data-id="${escapeHtml(p.id)}" ${!STORE.locationsLoaded?'disabled':''}>${I('trash')} Eliminar</button>`:''}</div></form>`;
 }
 function locationStatsMarkup(){
- const valid=new Set(STORE.products.map(p=>p.id));const assigned=STORE.locations.filter(x=>valid.has(x.skuId)&&LOCATION_SET.has(x.location));
+ const valid=new Set(STORE.products.map(p=>p.id));const assigned=STORE.locations.filter(x=>valid.has(x.skuId)&&validLocationCode(x.location));
  return `<span class="pill green">${nfmt(assigned.length)} ubicados</span><span class="pill">${nfmt(STORE.products.length)} productos</span>${STORE.locationsLoaded?'':'<span class="pill yellow">Cargando…</span>'}`;
 }
 // Vista administrativa sin listeners: buscar, ordenar, filtrar y exportar usando datos locales.
@@ -1207,7 +1225,7 @@ function locationAdminRows(){
  const locBySku=new Map(STORE.locations.map(x=>[x.skuId,x]));
  const q=norm(STATE.locationAdminQuery||'').trim().split(/\s+/).filter(Boolean);
  return STORE.products.map(p=>({p,loc:locBySku.get(p.id)||null})).filter(x=>{
-  const assigned=Boolean(x.loc?.location&&LOCATION_SET.has(x.loc.location));
+  const assigned=Boolean(x.loc?.location&&validLocationCode(x.loc.location));
   if(STATE.locationAdminFilter==='assigned'&&!assigned)return false;
   if(STATE.locationAdminFilter==='pending'&&assigned)return false;
   const search=norm([x.p.code,x.p.name,x.loc?.location,x.loc?.name].join(' '));
@@ -1217,28 +1235,52 @@ function locationAdminRows(){
 function locationAdminSummary(){
  if(!STORE.locationsLoaded)return '<div class="surface pad"><span class="pill yellow">Cargando ubicaciones…</span></div>';
  const valid=new Set(STORE.products.map(p=>p.id));
- const assigned=STORE.locations.filter(x=>valid.has(x.skuId)&&LOCATION_SET.has(x.location));
- const occupied=new Set(assigned.map(x=>x.location)).size;
- return `<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Productos ubicados',nfmt(assigned.length),'pin','green')}${kpi('Sin ubicación',nfmt(Math.max(0,STORE.products.length-assigned.length)),'inventory')}${kpi('Espacios utilizados',nfmt(occupied)+' / '+LOCATION_CODES.length,'dashboard')}</div>`;
+ const assigned=STORE.locations.filter(x=>valid.has(x.skuId)&&validLocationCode(x.location));
+ const occupied=new Set(assigned.map(x=>x.location));
+ const custom=Array.from(occupied).filter(x=>!LOCATION_SET.has(x)).length;
+ return `<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Productos ubicados',nfmt(assigned.length),'pin','green')}${kpi('Sin ubicación',nfmt(Math.max(0,STORE.products.length-assigned.length)),'inventory')}${kpi('Espacios utilizados',nfmt(occupied.size)+(custom?' · '+custom+' manuales':''),'dashboard')}</div>`;
 }
 function locationAdminTable(){
  if(!STORE.locationsLoaded)return '<div class="empty">Cargando asignaciones…</div>';
  const rows=locationAdminRows(),perPage=50,maxPage=Math.max(0,Math.ceil(rows.length/perPage)-1);
  STATE.locationAdminPage=Math.min(STATE.locationAdminPage,maxPage);
  const shown=rows.slice(STATE.locationAdminPage*perPage,(STATE.locationAdminPage+1)*perPage);
- const details=shown.map(({p,loc})=>`<tr><td><b>${escapeHtml(p.code)}</b></td><td>${escapeHtml(p.name)}</td><td>${loc?.location&&LOCATION_SET.has(loc.location)?`<span class="pill green">${escapeHtml(loc.location)}</span>`:'<span class="pill">Sin ubicación</span>'}</td><td>${escapeHtml(loc?.name||'—')}</td><td>${escapeHtml(locationStamp(loc?.updatedAt))}</td></tr>`).join('');
- return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Código</th><th>Producto</th><th>Ubicación</th><th>Asignado por</th><th>Último registro</th></tr></thead><tbody>${details||'<tr><td colspan="5" class="empty">Sin productos con ese filtro.</td></tr>'}</tbody></table></div>
+ const details=shown.map(({p,loc})=>{
+  const assigned=Boolean(loc?.location&&validLocationCode(loc.location));
+  const buttons=`<div class="loc-admin-actions"><button type="button" class="btn btn-outline btn-sm" data-action="loc-admin-edit" data-id="${escapeHtml(p.id)}" title="${assigned?'Editar':'Asignar'} ubicación">${I('edit')} ${assigned?'Editar':'Asignar'}</button>${assigned?`<button type="button" class="btn btn-danger btn-sm" data-action="loc-admin-delete" data-id="${escapeHtml(p.id)}" title="Eliminar solo esta ubicación">${I('trash')} Eliminar</button>`:''}</div>`;
+  return `<tr><td><b>${escapeHtml(p.code)}</b></td><td>${escapeHtml(p.name)}</td><td>${assigned?`<span class="pill green">${escapeHtml(loc.location)}</span>`:'<span class="pill">Sin ubicación</span>'}</td><td>${escapeHtml(loc?.name||'—')}</td><td>${escapeHtml(locationStamp(loc?.updatedAt))}</td><td>${buttons}</td></tr>`;
+ }).join('');
+ return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Código</th><th>Producto</th><th>Ubicación</th><th>Asignado por</th><th>Último registro</th><th class="right">Acciones</th></tr></thead><tbody>${details||'<tr><td colspan="6" class="empty">Sin productos con ese filtro.</td></tr>'}</tbody></table></div>
  <div class="loc-admin-footer"><span class="muted small">${nfmt(rows.length)} resultados · Página ${STATE.locationAdminPage+1} de ${maxPage+1}</span><div class="toolbar"><button class="btn btn-outline btn-sm" data-action="loc-admin-page" data-step="-1" ${STATE.locationAdminPage<=0?'disabled':''}>Anterior</button><button class="btn btn-outline btn-sm" data-action="loc-admin-page" data-step="1" ${STATE.locationAdminPage>=maxPage?'disabled':''}>Siguiente</button></div></div>`;
 }
 function locationStamp(iso){
  if(!iso)return '—';const d=new Date(iso);return Number.isNaN(d.getTime())?String(iso):new Intl.DateTimeFormat('es-EC',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}).format(d);
+}
+function locationAdminCodeOptions(value){
+ const valueClean=String(value||'').trim().toUpperCase().replace(/\s/g,'');
+ const found=locationSuggestionsFor(valueClean,10);
+ const buttons=found.map(code=>`<button type="button" data-action="loc-admin-choose-code" data-code="${escapeHtml(code)}">${escapeHtml(code)}</button>`).join('');
+ if(valueClean&&validLocationCode(valueClean)&&!LOCATION_SET.has(valueClean))return buttons+`<span class="small muted">Manual: ${escapeHtml(valueClean)} · Puedes guardarla.</span>`;
+ return buttons || '<span class="small muted">Escribe una ubicación, por ejemplo T7-N1.</span>';
+}
+function showLocationAdminEditor(skuId){
+ if(STORE.role!=='supervisor'||!STORE.locationsLoaded)throw Error('No se han cargado las ubicaciones.');
+ const product=STORE.products.find(p=>p.id===skuId);
+ if(!product)throw Error('Producto no encontrado.');
+ const existing=STORE.locations.find(x=>x.skuId===skuId);
+ const code=existing?.location||'';
+ showModal(code?'Editar ubicación':'Asignar ubicación',`<div class="note"><strong>${escapeHtml(product.name)}</strong><div>${escapeHtml(product.code)}</div><div style="margin-top:7px">Ubicación actual: <b>${escapeHtml(code||'Sin asignar')}</b></div></div>
+ <form class="form-stack" data-form="location-admin-save" style="margin-top:16px"><input type="hidden" name="skuId" value="${escapeHtml(skuId)}">
+ <div class="field"><label>Nueva ubicación</label><input class="input" name="location" id="loc-admin-code" autocomplete="off" autocapitalize="characters" placeholder="Ej. T5-N1, T7-N3, V1-N2" value="${escapeHtml(code)}" required></div>
+ <div class="loc-admin-code-options" id="loc-admin-code-options">${locationAdminCodeOptions(code)}</div>
+ <div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button class="btn btn-primary" type="submit">${I('check')} Guardar ubicación</button></div></form>`);
 }
 function supervisorLocationsMarkup(){
  const stamp=STORE.locationsSyncedAt?locationStamp(new Date(STORE.locationsSyncedAt).toISOString()):'Sin actualizar';
  return `${header('Ubicaciones','',`<button class="btn btn-outline" data-action="loc-admin-refresh">${I('refresh')} Actualizar</button><button class="btn btn-primary" data-action="loc-admin-export">${I('download')} Excel</button>`)}
  <div id="super-loc-stats">${locationAdminSummary()}</div>
  <section class="surface pad"><div class="surface-head"><h2 class="surface-title">Asignaciones registradas</h2><span id="super-loc-sync" class="small muted">Consulta: ${escapeHtml(stamp)}</span></div>
- <div class="loc-admin-filters"><div class="search-wrap">${I('search')}<input class="input" id="super-loc-search" value="${escapeHtml(STATE.locationAdminQuery)}" placeholder="Código, producto, ubicación o colaborador"></div><select class="input" id="super-loc-filter"><option value="assigned" ${STATE.locationAdminFilter==='assigned'?'selected':''}>Ubicados</option><option value="pending" ${STATE.locationAdminFilter==='pending'?'selected':''}>Sin ubicación</option><option value="all" ${STATE.locationAdminFilter==='all'?'selected':''}>Todos</option></select></div>
+ <div class="loc-admin-filters"><div class="search-wrap">${I('search')}<input class="input" id="super-loc-search" value="${escapeHtml(STATE.locationAdminQuery)}" placeholder="Buscar código, producto, ubicación o colaborador"></div><select class="input" id="super-loc-filter"><option value="assigned" ${STATE.locationAdminFilter==='assigned'?'selected':''}>Ubicados</option><option value="pending" ${STATE.locationAdminFilter==='pending'?'selected':''}>Sin ubicación</option><option value="all" ${STATE.locationAdminFilter==='all'?'selected':''}>Todos</option></select></div>
  <div id="super-loc-table">${locationAdminTable()}</div></section>`;
 }
 function updateSupervisorLocationsView(){
@@ -1257,7 +1299,7 @@ function locationConsultResults(){
   return parts.every(w=>hay.includes(w));
  }).sort((a,b)=>Number(Boolean(bySku.get(b.id)?.location))-Number(Boolean(bySku.get(a.id)?.location))||a.name.localeCompare(b.name)).slice(0,30);
  return matches.map(p=>{
-  const loc=bySku.get(p.id),assigned=Boolean(loc?.location&&LOCATION_SET.has(loc.location));
+  const loc=bySku.get(p.id),assigned=Boolean(loc?.location&&validLocationCode(loc.location));
   return `<div class="loc-consult-row"><div><strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.code)}</small></div><span class="pill ${assigned?'green':''}">${assigned?escapeHtml(loc.location):'Sin ubicación'}</span></div>`;
  }).join('')||'<div class="empty">No se encontraron productos.</div>';
 }
@@ -1588,7 +1630,7 @@ function prepareSound(){try{const AC=window.AudioContext||window.webkitAudioCont
 function beep(){try{const ctx=prepareSound();if(!ctx)return;const t=ctx.currentTime+.018;for(const [freq,offset] of [[720,0],[1030,.115]]){let osc=ctx.createOscillator(),gain=ctx.createGain();osc.type='sine';osc.frequency.value=freq;gain.gain.setValueAtTime(.0001,t+offset);gain.gain.exponentialRampToValueAtTime(.16,t+offset+.012);gain.gain.exponentialRampToValueAtTime(.0001,t+offset+.10);osc.connect(gain);gain.connect(ctx.destination);osc.start(t+offset);osc.stop(t+offset+.11)}navigator.vibrate?.(60)}catch(e){console.warn('El dispositivo no permitió emitir sonido',e)}}
 
 const refreshTable=debounce(updateTables,120);
-document.addEventListener('input',e=>{if(e.target.id==='dashboard-search'){STATE.query=e.target.value;STATE.page=0;refreshTable()}if(e.target.id==='inventory-search'){STATE.invQuery=e.target.value;STATE.invPage=0;refreshTable()}if(e.target.id==='expiry-search'){STATE.expiryQuery=e.target.value;refreshTable()}if(['worker-qty','box-factor'].includes(e.target.id))updateUnitControls();if(['unit-review-packs','unit-review-factor'].includes(e.target.id)){const packs=Number(document.getElementById('unit-review-packs')?.value),factor=Number(document.getElementById('unit-review-factor')?.value),preview=document.getElementById('unit-review-preview');if(preview&&Number.isSafeInteger(packs)&&Number.isSafeInteger(factor)&&packs>0&&factor>0)preview.innerHTML=`Teórico propuesto: <b>${nfmt(packs*factor)} unidades</b> (${nfmt(packs)} × ${nfmt(factor)}). Revisa antes de confirmar.`;}if(e.target.id==='super-loc-search'){STATE.locationAdminQuery=e.target.value;STATE.locationAdminPage=0;updateSupervisorLocationsView()}if(e.target.id==='loc-consult-input'){STATE.locationConsultQuery=e.target.value;const box=document.getElementById('loc-consult-results');if(box)box.innerHTML=locationConsultResults()}if(e.target.id==='loc-search'){STATE.locationQuery=e.target.value;STATE.locationSkuId=null;STATE.locationCode='';locationRefreshResults();locationRefreshForm()}if(e.target.id==='loc-code'){STATE.locationCode=e.target.value.toUpperCase().replace(/\s/g,'');const el=document.getElementById('loc-options');if(el)el.innerHTML=locationCodeSuggestions()}if(e.target.id==='worker-search'){STATE.workerQuery=e.target.value;STATE.selected=null;updateSuggestions()}if(e.target.id==='worker-expiry'){let el=document.getElementById('expiry-preview');let normalized=expiryInput(e.target.value);if(el)el.textContent=normalized?formatDate(normalized):e.target.value?'Usa 4 números: MMAA (ej. 0826)':'Ej. 0826 = Agosto/2026'}});
+document.addEventListener('input',e=>{if(e.target.id==='dashboard-search'){STATE.query=e.target.value;STATE.page=0;refreshTable()}if(e.target.id==='inventory-search'){STATE.invQuery=e.target.value;STATE.invPage=0;refreshTable()}if(e.target.id==='expiry-search'){STATE.expiryQuery=e.target.value;refreshTable()}if(['worker-qty','box-factor'].includes(e.target.id))updateUnitControls();if(['unit-review-packs','unit-review-factor'].includes(e.target.id)){const packs=Number(document.getElementById('unit-review-packs')?.value),factor=Number(document.getElementById('unit-review-factor')?.value),preview=document.getElementById('unit-review-preview');if(preview&&Number.isSafeInteger(packs)&&Number.isSafeInteger(factor)&&packs>0&&factor>0)preview.innerHTML=`Teórico propuesto: <b>${nfmt(packs*factor)} unidades</b> (${nfmt(packs)} × ${nfmt(factor)}). Revisa antes de confirmar.`;}if(e.target.id==='super-loc-search'){STATE.locationAdminQuery=e.target.value;STATE.locationAdminPage=0;updateSupervisorLocationsView()}if(e.target.id==='loc-admin-code'){const options=document.getElementById('loc-admin-code-options');if(options)options.innerHTML=locationAdminCodeOptions(e.target.value)}if(e.target.id==='loc-consult-input'){STATE.locationConsultQuery=e.target.value;const box=document.getElementById('loc-consult-results');if(box)box.innerHTML=locationConsultResults()}if(e.target.id==='loc-search'){STATE.locationQuery=e.target.value;STATE.locationSkuId=null;STATE.locationCode='';locationRefreshResults();locationRefreshForm()}if(e.target.id==='loc-code'){STATE.locationCode=e.target.value.toUpperCase().replace(/\s/g,'');const el=document.getElementById('loc-options');if(el)el.innerHTML=locationCodeSuggestions()}if(e.target.id==='worker-search'){STATE.workerQuery=e.target.value;STATE.selected=null;updateSuggestions()}if(e.target.id==='worker-expiry'){let el=document.getElementById('expiry-preview');let normalized=expiryInput(e.target.value);if(el)el.textContent=normalized?formatDate(normalized):e.target.value?'Usa 4 números: MMAA (ej. 0826)':'Ej. 0826 = Agosto/2026'}});
 document.addEventListener('change',e=>{if(e.target.matches('[data-invoice-factor]')){invoiceEditFactor(e.target.dataset.invoiceFactor,e.target.value);return;}if(e.target.matches('[data-invoice-qty]')){invoiceEditQuantity(e.target.dataset.invoiceQty,e.target.value);return;}if(e.target.matches('[data-invoice-target]')){invoiceChooseTarget(e.target.dataset.invoiceTarget,e.target.value);return;}if(e.target.id==='super-loc-filter'){STATE.locationAdminFilter=e.target.value;STATE.locationAdminPage=0;updateSupervisorLocationsView();return;}if(e.target.id==='invoice-filter'){INVOICE_REVIEW.filter=e.target.value;invoiceRenderReview();return;}if(e.target.id==='invoice-confirm'){INVOICE_REVIEW.confirmed=e.target.checked;invoiceRefreshControls();return;}if(e.target.id==='invoice-backup-ready'){INVOICE_REVIEW.backedUp=e.target.checked;invoiceRefreshControls();return;}if(e.target.matches('[data-invoice-link-check]')){invoiceToggleLink(e.target.dataset.invoiceLinkCheck,e.target.checked);return;}
 if(e.target.id==='select-all-novelties'){
   const queued=new Set(STORE.recounts.map(t=>t.skuId));
@@ -1601,6 +1643,25 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    if(STORE.role!=='locations')throw Error('Solo disponible en Ubicaciones.');
    STATE.locationView=STATE.locationView==='consult'?'assign':'consult';render();
    document.getElementById(STATE.locationView==='consult'?'loc-consult-input':'loc-search')?.focus({preventScroll:true});
+ }else if(action==='loc-admin-edit'){
+   if(STORE.role!=='supervisor')throw Error('Acción exclusiva de Supervisión.');
+   showLocationAdminEditor(id);
+ }else if(action==='loc-admin-choose-code'){
+   if(STORE.role!=='supervisor')throw Error('Acción exclusiva de Supervisión.');
+   const field=document.getElementById('loc-admin-code');if(field){field.value=b.dataset.code||'';const opt=document.getElementById('loc-admin-code-options');if(opt)opt.innerHTML=locationAdminCodeOptions(field.value);}
+ }else if(action==='loc-admin-delete'){
+   if(STORE.role!=='supervisor')throw Error('Acción exclusiva de Supervisión.');
+   if(!STORE.locationsLoaded)throw Error('Espera a que se carguen las ubicaciones.');
+   if(STATE.locationBusy)return;
+   const current=STORE.locations.find(x=>x.skuId===id);
+   const product=STORE.products.find(p=>p.id===id);
+   if(!product||!current?.location)throw Error('Este producto ya no tiene ubicación. Pulsa Actualizar.');
+   if(!confirm(`¿Eliminar la ubicación ${current.location} de ${product.name}?\n\nNo se eliminará el producto ni afectará el inventario.`))return;
+   STATE.locationBusy=true;
+   try{
+     await adapter.deleteLocation(id,current.updatedAt||'');
+     updateSupervisorLocationsView();notify('Ubicación eliminada. Producto e inventario intactos.');
+   }finally{STATE.locationBusy=false}
  }else if(action==='loc-admin-refresh'){
    if(STORE.role!=='supervisor')throw Error('Solo Supervisión.');
    if(STORE.appMode==='firebase'&&STORE.locationsLoaded&&locationRemoteFetchedAt&&Date.now()-locationRemoteFetchedAt<LOCATIONS_REFRESH_GAP_MS){notify('Consulta reciente. Espera unos segundos para actualizar nuevamente.');return;}
@@ -1741,13 +1802,27 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
  }catch(err){notify(err.message||'Ocurrió un error.','error')}});
 document.addEventListener('submit',async e=>{let form=e.target.closest('form[data-form]');if(!form)return;e.preventDefault();if(STATE.busy)return;if(['count','surplus','recount-count'].includes(form.dataset.form))prepareSound();STATE.busy=true;let btn=form.querySelector('[type=submit],button:not([type])'),fd=Object.fromEntries(new FormData(form));if(btn)btn.disabled=true;try{
  switch(form.dataset.form){
+ case 'location-admin-save':{
+   if(STORE.role!=='supervisor')throw Error('Acción exclusiva de Supervisión.');
+   if(!STORE.locationsLoaded)throw Error('Espera a que se carguen las ubicaciones.');
+   const skuId=String(fd.skuId||'');
+   const product=STORE.products.find(p=>p.id===skuId);
+   if(!product)throw Error('Producto no encontrado.');
+   const code=String(fd.location||'').trim().toUpperCase().replace(/\s/g,'');
+   if(!validLocationCode(code))throw Error('Ubicación no válida. Escribe T5-N1, T7-N3 o V1-N2 (letra, número, -N y nivel).');
+   const current=STORE.locations.find(x=>x.skuId===skuId);
+   if(current?.location===code){closeModal();notify('El producto ya tiene esa ubicación.');break;}
+   await adapter.saveLocation(skuId,code,current?.updatedAt||'');
+   closeModal();updateSupervisorLocationsView();notify('Ubicación '+code+' guardada para '+product.name+'.');
+   break;
+ }
  case 'location-save':{
    if(STORE.role!=='locations')throw Error('Ingresa desde Ubicaciones.');
    if(!STORE.locationsLoaded)throw Error('Espera la carga de ubicaciones antes de guardar.');
    const skuId=String(fd.skuId||''),code=String(fd.location||'').trim().toUpperCase().replace(/\s/g,'');
    const p=STORE.products.find(x=>x.id===skuId);
    if(!p)throw Error('Producto no encontrado en el catálogo actual.');
-   if(!LOCATION_SET.has(code))throw Error('Ubicación no válida. Elige una de las 78 sugerencias.');
+   if(!validLocationCode(code))throw Error('Ubicación no válida. Escribe T5-N1, T7-N3 o V1-N2 (letra, número, -N y nivel).');
    const expected=STORE.locations.find(x=>x.skuId===skuId)?.updatedAt||'';
    await adapter.saveLocation(skuId,code,expected);
    STATE.locationSkuId=null;STATE.locationQuery='';STATE.locationCode='';
