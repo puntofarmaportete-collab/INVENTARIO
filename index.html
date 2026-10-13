@@ -1277,7 +1277,7 @@ function showLocationAdminEditor(skuId){
 }
 function supervisorLocationsMarkup(){
  const stamp=STORE.locationsSyncedAt?locationStamp(new Date(STORE.locationsSyncedAt).toISOString()):'Sin actualizar';
- return `${header('Ubicaciones','',`<button class="btn btn-outline" data-action="loc-admin-refresh">${I('refresh')} Actualizar</button><button class="btn btn-primary" data-action="loc-admin-export">${I('download')} Excel</button>`)}
+ return `${header('Ubicaciones','',`<button class="btn btn-outline" data-action="loc-admin-refresh">${I('refresh')} Actualizar</button><button class="btn btn-outline" data-action="loc-copy-map">${I('copy')} Copiar mapeo</button><button class="btn btn-primary" data-action="loc-admin-export">${I('download')} Excel</button>`)}
  <div id="super-loc-stats">${locationAdminSummary()}</div>
  <section class="surface pad"><div class="surface-head"><h2 class="surface-title">Asignaciones registradas</h2><span id="super-loc-sync" class="small muted">Consulta: ${escapeHtml(stamp)}</span></div>
  <div class="loc-admin-filters"><div class="search-wrap">${I('search')}<input class="input" id="super-loc-search" value="${escapeHtml(STATE.locationAdminQuery)}" placeholder="Buscar código, producto, ubicación o colaborador"></div><select class="input" id="super-loc-filter"><option value="assigned" ${STATE.locationAdminFilter==='assigned'?'selected':''}>Ubicados</option><option value="pending" ${STATE.locationAdminFilter==='pending'?'selected':''}>Sin ubicación</option><option value="all" ${STATE.locationAdminFilter==='all'?'selected':''}>Todos</option></select></div>
@@ -1311,7 +1311,7 @@ function locationsConsultMarkup(){
 function locationsWorkerMarkup(){
  const valid=new Set(STORE.products.map(p=>p.id));
  const recent=STORE.locations.filter(x=>valid.has(x.skuId)).slice().sort((a,b)=>String(b.updatedAt||'').localeCompare(String(a.updatedAt||''))).slice(0,8);
- return `<main class="loc-shell"><header class="loc-header">${logo()}<div class="toolbar">${badgeConnection()}<button class="btn btn-outline btn-sm" data-action="loc-view-toggle" title="${STATE.locationView==='consult'?'Volver a asignar':'Consultar ubicaciones'}">${I(STATE.locationView==='consult'?'pin':'search')} ${STATE.locationView==='consult'?'Asignar':'Consultar'}</button><button class="btn btn-outline btn-sm" data-action="loc-refresh" title="Volver a consultar ubicaciones">${I('refresh')} Actualizar</button><button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header>
+ return `<main class="loc-shell"><header class="loc-header">${logo()}<div class="toolbar">${badgeConnection()}<button class="btn btn-outline btn-sm" data-action="loc-view-toggle" title="${STATE.locationView==='consult'?'Volver a asignar':'Consultar ubicaciones'}">${I(STATE.locationView==='consult'?'pin':'search')} ${STATE.locationView==='consult'?'Asignar':'Consultar'}</button><button class="btn btn-outline btn-sm" data-action="loc-copy-map" title="Copiar todas las ubicaciones asignadas">${I('copy')} Copiar mapeo</button><button class="btn btn-outline btn-sm" data-action="loc-refresh" title="Volver a consultar ubicaciones">${I('refresh')} Actualizar</button><button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header>
  <h1 class="loc-title">Mis Ubicaciones</h1><div class="loc-metrics" id="loc-metrics">${locationStatsMarkup()}</div>
  ${STATE.locationView==='consult'?locationsConsultMarkup():`<div class="loc-grid"><section class="surface pad"><h2 class="surface-title">Buscar producto</h2><div class="field"><label>Nombre o código</label><input class="input" id="loc-search" placeholder="Nombre o código" value="${escapeHtml(STATE.locationQuery)}" autocomplete="off"></div><div id="loc-results" class="loc-search-results">${locationsSuggestions()}</div></section>
  <section class="surface pad"><h2 class="surface-title">Asignar ubicación</h2><div id="loc-assignment">${locationAssignmentMarkup()}</div></section></div>
@@ -1667,6 +1667,15 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    if(STORE.appMode==='firebase'&&STORE.locationsLoaded&&locationRemoteFetchedAt&&Date.now()-locationRemoteFetchedAt<LOCATIONS_REFRESH_GAP_MS){notify('Consulta reciente. Espera unos segundos para actualizar nuevamente.');return;}
    if(STORE.appMode==='firebase')await adapter.loadLocations(true);else await adapter.loadLocations();
    updateSupervisorLocationsView();notify('Panel de ubicaciones actualizado.');
+ }else if(action==='loc-copy-map'){
+   if(!['supervisor','locations'].includes(STORE.role)||!STORE.locationsLoaded)throw Error('Carga primero las ubicaciones.');
+   const bySku=new Map(STORE.locations.map(x=>[x.skuId,x]));
+   const rows=STORE.products.map(p=>({p,loc:bySku.get(p.id)})).filter(x=>x.loc?.location&&validLocationCode(x.loc.location)).map(({p,loc})=>({codigo:String(p.code||'').trim(),producto:String(p.name||'').trim(),ubicacion:String(loc.location).trim().toUpperCase()}));
+   if(!rows.length)throw Error('No hay ubicaciones asignadas para copiar.');
+   const payload=JSON.stringify({formato:'PUNTOFARMA_UBICACIONES_V1',fecha:new Date().toISOString(),ubicaciones:rows});
+   if(!navigator.clipboard?.writeText)throw Error('Portapapeles no disponible; abre la web con HTTPS.');
+   await navigator.clipboard.writeText(payload);
+   notify(`${rows.length} ubicaciones copiadas. Abre Atención al Cliente → Configuración → Pegar ubicaciones.`);
  }else if(action==='loc-admin-export'){
    if(STORE.role!=='supervisor'||!STORE.locationsLoaded)throw Error('Carga primero las ubicaciones.');
    await exportXlsx(locationAdminRows().map(({p,loc})=>({codigo:p.code,producto:p.name,ubicacion:loc?.location||'',colaborador:loc?.name||'',modificado:loc?.updatedAt||''})),`puntofarma_ubicaciones_${localToday()}.xlsx`);
