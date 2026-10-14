@@ -307,7 +307,7 @@ async function hashPassword(p,salt){const data=new TextEncoder().encode(salt+':'
 function logo(small=false){return `<span class="brand-lockup ${small?'brand-small':''}"><img class="logo-img" src="https://puntofarma-ec.com/wp-content/uploads/2025/11/logo_punto_farma_texto.png" alt="Logo de PuntoFarma" onerror="this.style.display='none';this.nextElementSibling.style.display='inline'"/><span class="brand-fallback" style="display:none">Punto<b>FARMA</b></span></span>`}
 function avatar(n){let initials=String(n||'').split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();return `<span class="avatar">${escapeHtml(initials||'PF')}</span>`}
 function badgeConnection(){return STORE.appMode==='demo'?`<span class="pill yellow"><span class="dot"></span> Demo local</span>`:`<span class="pill ${STORE.connected?'green':'yellow'}"><span class="dot"></span> ${STORE.connected?'Firebase conectado':'Sincronizando'}</span>`}
-function cleanSku(p){return {id:p.id,code:String(p.code||''),name:String(p.name||''),category:String(p.category||''),presentation:String(p.presentation||''),unitsPerPresentation:Number(p.unitsPerPresentation||1),packs:Number(p.packs||0),theoretical:Number(p.theoretical||0),pvpUnit:Number(p.pvpUnit||0),pvpTotal:Number(p.pvpTotal||0),costUnit:Number(p.costUnit||0),costTotal:Number(p.costTotal||0),sourceRows:p.sourceRows||[],unitReviewResolved:p.unitReviewResolved===true}}
+function cleanSku(p){return {id:p.id,code:String(p.code||''),name:String(p.name||''),category:String(p.category||''),presentation:String(p.presentation||''),unitsPerPresentation:Number(p.unitsPerPresentation||1),packs:Number(p.packs||0),theoretical:Number(p.theoretical||0),pvpUnit:Number(p.pvpUnit||0),pvpTotal:Number(p.pvpTotal||0),pvp:p.pvp??null,costUnit:Number(p.costUnit||0),costTotal:Number(p.costTotal||0),sourceRows:p.sourceRows||[],unitReviewResolved:p.unitReviewResolved===true,fractionAllowed:p.fractionAllowed===true,fractionUnits:Number(p.fractionUnits||0),fractionPvp:p.fractionPvp==null?null:Number(p.fractionPvp),fractionOverride:p.fractionOverride===true}}
 function publicProduct(p){return {id:p.id,code:p.code,name:p.name,category:p.category,presentation:p.presentation,unitsPerPresentation:p.unitsPerPresentation}}
 function loadLocalData(){let arr=loadDemo('products',null);if(!arr){arr=(window.PF_SEED_PRODUCTS||[]).map(cleanSku);saveDemo('products',arr)}STORE.products=arr;STORE.counts=loadDemo('counts',[]);STORE.surplus=loadDemo('surplus',[]);STORE.markers=STORE.counts.map(c=>({id:c.id,skuId:c.skuId,uid:c.uid}));STORE.recounts=loadDemo('recounts',[]);STORE.recountEntries=loadDemo('recountEntries',[]);STORE.profiles=loadDemo('profiles',[]);STORE.locations=loadDemo('locations',[]);STORE.locationsLoaded=true;STORE.locationsSyncedAt=Date.now();STORE.connected=true}
 function syncLocal(){saveDemo('products',STORE.products);saveDemo('counts',STORE.counts);saveDemo('surplus',STORE.surplus);saveDemo('recounts',STORE.recounts);saveDemo('recountEntries',STORE.recountEntries);saveDemo('profiles',STORE.profiles);saveDemo('locations',STORE.locations);STORE.markers=STORE.counts.map(c=>({id:c.id,skuId:c.skuId,uid:c.uid}))}
@@ -381,6 +381,12 @@ async function initFirebase(){const cfg=window.PF_FIREBASE_CONFIG;if(!cfg||!cfg.
  }catch(e){console.error(e);document.getElementById('app').innerHTML=`<main class="boot"><h2>No se pudo conectar a Firebase</h2><p>${escapeHtml(e.message)}</p><button class="btn btn-primary" onclick="location.reload()">Reintentar</button></main>`;return 'error'}
 }
 function firestoreProfile(r){return {...r,id:r.id||r.uid}}
+
+function serviceProjection(p){
+ const price=p.pvp!=null?p.pvp:(p.pvpUnit!=null&&Number(p.pvpUnit)>0?p.pvpUnit:null);
+ return {code:String(p.code||''),name:String(p.name||''),qty:Math.max(0,Number(p.theoretical)||0),pvp:price==null?null:Number(price),category:String(p.category||''),presentation:String(p.presentation||''),fractionAllowed:p.fractionAllowed===true,fractionUnits:Number(p.fractionUnits||0),fractionPvp:p.fractionPvp==null?null:Number(p.fractionPvp),fractionOverride:p.fractionOverride===true,updatedAt:new Date().toISOString()};
+}
+
 const firebaseAdapter={
  async authenticate(username,password){
   const {authm,auth,db,fsm}=fb;
@@ -433,7 +439,7 @@ const firebaseAdapter={
  async linkSurplus(items){const {fsm,db}=fb;for(let i=0;i<items.length;i+=150){const b=fsm.writeBatch(db);for(const a of items.slice(i,i+150)){b.update(fsm.doc(db,'surplus',a.id),{linkedSkuId:a.skuId,linkedAt:now(),linkedBy:STORE.uid})}await b.commit()}},
  async editCount(id,data){await fb.fsm.updateDoc(fb.fsm.doc(fb.db,'counts',id),{...data,updatedAt:now()})},
  async deleteCount(id){const b=fb.fsm.writeBatch(fb.db);b.delete(fb.fsm.doc(fb.db,'counts',id));b.delete(fb.fsm.doc(fb.db,'markers',id));await b.commit();if(STORE.role==='operator'&&refreshMarkerProgress)await refreshMarkerProgress().catch(e=>console.warn('Avance pendiente de actualizar',e))},
- async upsertProducts(ps){const {db,fsm}=fb;if(!ps.length)return;for(let i=0;i<ps.length;i+=200){let b=fsm.writeBatch(db);for(let p of ps.slice(i,i+200)){b.set(fsm.doc(db,'catalog',p.id),publicProduct(p));const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);b.set(fsm.doc(db,'stock',id),{...stock},{merge:true});}if(i+200>=ps.length)b.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:ps.length<=12?'upsert':'full',ids:ps.length<=12?ps.map(p=>p.id):[]});await b.commit()}},
+ async upsertProducts(ps){const {db,fsm}=fb;if(!ps.length)return;for(let i=0;i<ps.length;i+=125){let b=fsm.writeBatch(db);for(let p of ps.slice(i,i+125)){b.set(fsm.doc(db,'catalog',p.id),publicProduct(p));const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);b.set(fsm.doc(db,'stock',id),{...stock},{merge:true});b.set(fsm.doc(db,'service_products',p.id),serviceProjection(p));}if(i+125>=ps.length)b.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:ps.length<=12?'upsert':'full',ids:ps.length<=12?ps.map(p=>p.id):[]});await b.commit()}},
  async applyTheoryUpdate(ps,onProgress){
    const {db,fsm}=fb;
    if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected)throw Error('Se requiere supervisión con Firebase conectado.');
@@ -453,6 +459,7 @@ const firebaseAdapter={
        batch.set(fsm.doc(db,'catalog',p.id),publicProduct(p));
        const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);
        batch.set(fsm.doc(db,'stock',id),stock,{merge:true});
+       batch.set(fsm.doc(db,'service_products',p.id),serviceProjection(p));
      }
      if(i+125>=ps.length)batch.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:'full',ids:[]});
      await batch.commit();finished+=Math.min(125,ps.length-i);onProgress?.(finished,ps.length);
@@ -479,19 +486,33 @@ const firebaseAdapter={
      for(const planned of changes){
        const old=byId.get(planned.id),qty=invoiceProposedQty(review.items.find(x=>(x.targetId==='NEW'?x.newId:x.targetId)===planned.id));
        if(!Number.isSafeInteger(qty)||qty<=0)throw Error('Unidades a sumar inválidas en '+planned.code+'.');
-       const ref=fsm.doc(db,'stock',planned.id),cat=fsm.doc(db,'catalog',planned.id);
+       const ref=fsm.doc(db,'stock',planned.id),cat=fsm.doc(db,'catalog',planned.id),serviceRef=fsm.doc(db,'service_products',planned.id);
        const state=await fsm.runTransaction(db,async tx=>{
          // El recibo se marca en EL MISMO documento donde se incrementa el stock.
          // Si se repite este Excel, la transacción no vuelve a sumar.
          const st=await tx.get(ref);
          const current=st.exists()?st.data():null;
          const applied=Array.isArray(current?.appliedStockImports)?current.appliedStockImports:[];
-         if(applied.includes(review.importKey))return 'duplicado';
+         if(applied.includes(review.importKey)){
+           // El archivo se procesó anteriormente. Reparar únicamente el espejo
+           // de consulta si no estaba publicado, SIN volver a sumar stock.
+           const priorMirror=await tx.get(serviceRef);
+           const prevQty=Number(current?.theoretical||0);
+           if(!priorMirror.exists()||Number(priorMirror.data().qty)!==prevQty){
+             const previous=priorMirror.exists()?priorMirror.data():{};
+             tx.set(serviceRef,{...serviceProjection({...old,...current,theoretical:prevQty}),
+               // Mantener cualquier PVP previamente publicado si stock aún no lo conoce.
+               pvp:current?.pvp!=null?Number(current.pvp):previous.pvp??old?.pvp??null});
+           }
+           return 'duplicado';
+         }
          if(old){
            if(!st.exists())throw Error('Falta stock para '+old.code+'. Vuelve a sincronizar.');
            const prev=Number(current.theoretical);
            if(!Number.isSafeInteger(prev)||prev<0||prev+qty>10000000)throw Error('Stock fuera de rango en '+old.code);
            tx.update(ref,{theoretical:prev+qty,appliedStockImports:[...applied,review.importKey],lastStockAdditionQty:qty,lastStockAdditionAt:now()});
+           // Stock y producto visible en Atención al Cliente se publican atómicamente.
+           tx.set(serviceRef,serviceProjection({...old,...current,theoretical:prev+qty}));
          }else{
            // Evita reemplazar una referencia creada desde otra sesión.
            const catSnap=await tx.get(cat);
@@ -499,6 +520,7 @@ const firebaseAdapter={
            const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(planned);
            tx.set(cat,publicProduct(planned));
            tx.set(ref,{...stock,appliedStockImports:[review.importKey],lastStockAdditionQty:qty,lastStockAdditionAt:now()});
+           tx.set(serviceRef,serviceProjection(planned));
          }
          return 'agregado';
        });
@@ -520,6 +542,7 @@ const firebaseAdapter={
   // código sigue disponible para los colaboradores en la cola de Reconteo.
   b.delete(fsm.doc(db,'catalog',id));
   b.delete(fsm.doc(db,'stock',id));
+  b.delete(fsm.doc(db,'service_products',id));
   b.delete(fsm.doc(db,'recounts',id));
   b.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:'delete',ids:[id]});
   await b.commit();
@@ -1011,7 +1034,35 @@ function scheduleRender(){clearTimeout(toastTimer);toastTimer=setTimeout(()=>{if
 },240)}
 function appEnter(role,user){if(STORE.appMode==='demo')loadLocalData();STORE.user=user;STORE.uid=user.id;STORE.role=role;STATE.screen='app';STATE.panel='dashboard';STATE.selected=null;STATE.query='';STATE.page=0;STATE.invPage=0;STATE.loginType='';STATE.recountActiveId=null;STATE.locationSkuId=null;STATE.locationQuery='';STATE.locationCode='';STATE.locationView='assign';STATE.locationConsultQuery='';STATE.locationAdminQuery='';STATE.locationAdminFilter='assigned';STATE.locationAdminPage=0;STATE.locationSupervisorRequested=false;if(STORE.appMode==='firebase')adapter.start(role,user.id);render()}
 function signOut(){if(STORE.appMode==='firebase')adapter.signOut().catch(console.error);STORE.user=null;STORE.uid=null;STORE.role=null;STATE.screen='access';STATE.loginType='';STATE.selected=null;if(STORE.appMode==='firebase'){STORE.counts=[];STORE.surplus=[];STORE.markers=[];STORE.products=[];STORE.profiles=[];STORE.recounts=[];STORE.recountEntries=[];STORE.locations=[];STORE.locationsLoaded=false;STORE.locationsSyncedAt=0};render()}
-function entryMarkup(){let hasAdmin=STORE.profiles.some(p=>p.role==='supervisor');return `<div class="entry"><section class="entry-art"><div class="brand">${logo()}</div><div class="entry-illustration"><div class="entry-orbit"></div><div class="entry-circle">${I('inventory')}</div></div><div><h1>Tu inventario,<br><em>bajo control.</em></h1><div class="entry-art-footer">PUNTOFARMA · INVENTORY CONTROL · ECUADOR</div></div></section><section class="entry-right"><div class="entry-content">${!STATE.loginType?`<span class="eyebrow">Bienvenido a PuntoFarma</span><h2>¿Cómo deseas ingresar?</h2><button class="role-card" data-action="role" data-role="supervisor"><span class="role-icon">${I('shield')}</span><span><strong>Supervisión</strong><small>Administración y control de inventario</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="operator"><span class="role-icon lime">${I('inventory')}</span><span><strong>Conteo físico</strong><small>Registro de productos desde celular</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="recount"><span class="role-icon lime">${I('refresh')}</span><span><strong>Reconteo</strong><small>Revisión de códigos con novedades</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="locations"><span class="role-icon lime">${I('pin')}</span><span><strong>Ubicaciones</strong><small>Asignar productos a ubicaciones</small></span>${I('arrow','arrow-circle')}</button>`:(STATE.loginType==='operator'||STATE.loginType==='recount'||STATE.loginType==='locations')?`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">${STATE.loginType==='recount'?'Reconteo':STATE.loginType==='locations'?'Ubicaciones':'Conteo físico'}</span><h2>${STATE.loginType==='recount'?'Vamos a revisar novedades':STATE.loginType==='locations'?'Vamos a ubicar los productos':'Comencemos el inventario'}</h2><form class="form-stack" data-form="worker-login"><div class="field"><label>Tu nombre y apellido</label><input class="input" name="displayName" placeholder="Ej. María Rodríguez" required minlength="3" autocomplete="name" autofocus></div><button class="btn btn-primary btn-block">Ingresar ${I('arrow')}</button></form>`:`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">Acceso administrativo</span><h2>${STORE.appMode==='demo'&&!hasAdmin?'Configura el supervisor':'Acceso a Supervisión'}</h2><form class="form-stack" data-form="${STORE.appMode==='demo'&&!hasAdmin?'first-admin':'admin-login'}"><div class="field"><label>Usuario</label><input class="input" name="username" required placeholder="Ej. admin" minlength="3" autocomplete="username"></div>${STORE.appMode==='demo'&&!hasAdmin?`<div class="field"><label>Nombre visible</label><input class="input" name="displayName" required placeholder="Ej. Supervisor PuntoFarma"></div>`:''}<div class="field"><label>Contraseña</label><input class="input" name="password" type="password" required minlength="4" placeholder="Tu contraseña" autocomplete="${STORE.appMode==='demo'&&!hasAdmin?'new-password':'current-password'}"></div><button class="btn btn-primary btn-block">${STORE.appMode==='demo'&&!hasAdmin?'Crear supervisor':'Iniciar sesión'} ${I('arrow')}</button></form>`}</div></section></div>`}
+
+// Directorio central de colaboradores: una lectura al abrir el selector, sin listeners permanentes.
+let PF_WORKER_NAMES=[];
+async function pfLoadWorkerNames(){
+ if(!fb){PF_WORKER_NAMES=loadDemo('worker_directory',[]);render();return;}
+ const {fsm,db,authm,auth}=fb;
+ try{
+  if(auth.authStateReady)await auth.authStateReady();
+  if(!auth.currentUser)await authm.signInAnonymously(auth);
+  const snap=await fsm.getDoc(fsm.doc(db,'settings','worker_directory'));
+  PF_WORKER_NAMES=(snap.exists()&&Array.isArray(snap.data().names)?snap.data().names:[])
+   .filter(x=>typeof x==='string'&&x.trim().length>=3).map(x=>x.trim()).sort((a,b)=>a.localeCompare(b,'es'));
+ }catch(e){console.error('Directorio colaboradores',e);notify('No se pudo consultar los nombres. Revisa las reglas de Firestore.','error')}
+ if(STATE.screen==='access'&&['operator','recount','locations'].includes(STATE.loginType))render();
+}
+async function pfSaveWorkerNames(names){
+ if(STORE.role!=='supervisor')throw Error('Solo Supervisión puede administrar colaboradores.');
+ const normalized=[...new Set(names.map(x=>String(x).replace(/\s+/g,' ').trim()).filter(x=>x.length>=3))].sort((a,b)=>a.localeCompare(b,'es'));
+ if(STORE.appMode==='firebase')await fb.fsm.setDoc(fb.fsm.doc(fb.db,'settings','worker_directory'),{names:normalized,updatedAt:now()});
+ else saveDemo('worker_directory',normalized);
+ PF_WORKER_NAMES=normalized;render();
+}
+function pfWorkerDirectoryMarkup(){
+ return `<section class="surface pad" style="margin-top:18px"><div class="surface-head"><div><h3 class="surface-title">Colaboradores · selección de nombres</h3><p></p></div><span class="pill">${PF_WORKER_NAMES.length} nombres</span></div>
+ <form data-form="pf-add-worker" class="toolbar" style="margin-bottom:15px"><input class="input" name="displayName" required minlength="3" maxlength="100" placeholder="Nombre y apellido del colaborador" style="flex:1;min-width:180px"><button class="btn btn-primary" type="submit">Agregar</button></form>
+ <div class="chiprow">${PF_WORKER_NAMES.length?PF_WORKER_NAMES.map((n,i)=>`<span class="chip">${escapeHtml(n)} <button type="button" data-action="pf-delete-worker" data-id="${i}" title="Eliminar nombre" style="border:0;background:none;color:#b42318;cursor:pointer;font-weight:bold">×</button></span>`).join(''):'<span class="muted small">No hay colaboradores registrados.</span>'}</div>
+ <p class="small muted" style="margin-top:13px"></p></section>`;
+}
+function entryMarkup(){let hasAdmin=STORE.profiles.some(p=>p.role==='supervisor');return `<div class="entry"><section class="entry-art"><div class="brand">${logo()}</div><div class="entry-illustration"><div class="entry-orbit"></div><div class="entry-circle">${I('inventory')}</div></div><div><h1>Tu inventario,<br><em>bajo control.</em></h1><div class="entry-art-footer">PUNTOFARMA · INVENTORY CONTROL · ECUADOR</div></div></section><section class="entry-right"><div class="entry-content">${!STATE.loginType?`<span class="eyebrow">Bienvenido a PuntoFarma</span><h2>¿Cómo deseas ingresar?</h2><button class="role-card" data-action="role" data-role="supervisor"><span class="role-icon">${I('shield')}</span><span><strong>Supervisión</strong><small>Administración y control de inventario</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="operator"><span class="role-icon lime">${I('inventory')}</span><span><strong>Conteo físico</strong><small>Registro de productos desde celular</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="recount"><span class="role-icon lime">${I('refresh')}</span><span><strong>Reconteo</strong><small>Revisión de códigos con novedades</small></span>${I('arrow','arrow-circle')}</button><button class="role-card" data-action="role" data-role="locations"><span class="role-icon lime">${I('pin')}</span><span><strong>Ubicaciones</strong><small>Asignar productos a ubicaciones</small></span>${I('arrow','arrow-circle')}</button>`:(STATE.loginType==='operator'||STATE.loginType==='recount'||STATE.loginType==='locations')?`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">${STATE.loginType==='recount'?'Reconteo':STATE.loginType==='locations'?'Ubicaciones':'Conteo físico'}</span><h2>${STATE.loginType==='recount'?'Vamos a revisar novedades':STATE.loginType==='locations'?'Vamos a ubicar los productos':'Comencemos el inventario'}</h2><form class="form-stack" data-form="worker-login"><div class="field"><label>Tu nombre y apellido</label><select class="input" name="displayName" required><option value="">Selecciona tu nombre</option>${PF_WORKER_NAMES.map(n=>`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}</select><small style="color:#7790a0">Si no aparece tu nombre, solicítale al supervisor que lo agregue.</small></div><button class="btn btn-primary btn-block">Ingresar ${I('arrow')}</button></form>`:`<button class="entry-back" data-action="back">${I('back')} Volver</button><span class="eyebrow">Acceso administrativo</span><h2>${STORE.appMode==='demo'&&!hasAdmin?'Configura el supervisor':'Acceso a Supervisión'}</h2><form class="form-stack" data-form="${STORE.appMode==='demo'&&!hasAdmin?'first-admin':'admin-login'}"><div class="field"><label>Usuario</label><input class="input" name="username" required placeholder="Ej. admin" minlength="3" autocomplete="username"></div>${STORE.appMode==='demo'&&!hasAdmin?`<div class="field"><label>Nombre visible</label><input class="input" name="displayName" required placeholder="Ej. Supervisor PuntoFarma"></div>`:''}<div class="field"><label>Contraseña</label><input class="input" name="password" type="password" required minlength="4" placeholder="Tu contraseña" autocomplete="${STORE.appMode==='demo'&&!hasAdmin?'new-password':'current-password'}"></div><button class="btn btn-primary btn-block">${STORE.appMode==='demo'&&!hasAdmin?'Crear supervisor':'Iniciar sesión'} ${I('arrow')}</button></form>`}</div></section></div>`}
 function render(){
  if(STATE.screen==='access'){app.innerHTML=entryMarkup();return}
  if(STORE.appMode==='firebase'&&!STORE.ready){
@@ -1237,11 +1288,11 @@ function recountMarkup(){
  const queue=`<section class="surface pad" id="recount-queue"><div class="surface-head"><h3 class="surface-title">Códigos disponibles</h3><span class="pill green">${pending.length} pendientes</span></div><p class="small muted" style="margin-bottom:12px">Al seleccionar un código, se reservará para ti y desaparecerá de las listas de otros colaboradores.</p><div class="recount-items">${pending.map(t=>`<div class="recount-item"><div><strong>${escapeHtml(t.name)}</strong><small>${escapeHtml(t.code)} · ${(t.positions||[]).length} posición(es)</small></div><button class="btn btn-primary btn-sm" data-action="claim-recount" data-id="${escapeHtml(t.skuId)}">Tomar</button></div>`).join('')||'<div class="empty">No hay códigos disponibles para reconteo.</div>'}</div></section>`;
  return `<div class="worker-shell recount-shell"><header class="worker-header">${logo()}<div class="chiprow">${badgeConnection()}<button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header><div class="worker-welcome" id="recount-metrics"><span style="font-size:11px;letter-spacing:1px;font-weight:800">RECONTEO DE NOVEDADES</span><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0">¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><button type="button" class="btn btn-outline btn-sm" style="color:#fff;border-color:rgba(255,255,255,.55);background:rgba(255,255,255,.12);flex-shrink:0" data-action="sync-progress" title="Comprobar avance general">${I('refresh')} Actualizar</button></div><div class="worker-metrics"><div><small>Disponibles</small><strong>${pending.length}</strong></div><div><small>En revisión</small><strong>${tasks.filter(t=>t.status==='in_progress').length}</strong></div><div><small>Finalizados</small><strong>${done.length}</strong></div></div></div><div class="recount-cols"><section class="surface pad recount-work"><div class="surface-head"><h3 class="surface-title">${active?'Código reservado':'Mi reconteo'}</h3>${active?'<span class="pill yellow">Asignado a ti</span>':''}</div>${active?`<div class="selected-prod recount-selected-product" style="margin-bottom:15px"><div><strong>${escapeHtml(active.name)}</strong><small>${escapeHtml(active.code)}</small></div><a class="btn btn-outline btn-sm recount-image-link" href="${escapeHtml('https://www.google.com/search?tbm=isch&q='+encodeURIComponent(active.name+' '+active.code))}" target="_blank" rel="noopener noreferrer" title="Buscar imágenes del producto en Google">${I('search')} Ver imagen</a></div><h4 style="margin-bottom:9px">Posiciones registradas anteriormente</h4><div class="chiprow" style="margin-bottom:13px">${(active.positions||[]).map(x=>`<span class="position-chip">${escapeHtml(x)}</span>`).join('')||'<span class="small muted">Sin posiciones previas: revisa las cajas y registra dónde encontraste el producto. Si no aparece, utiliza «No encontré unidades».</span>'}</div><form id="recount-form" data-form="recount-count" class="form-stack"><div class="form-row"><div class="field"><label>Unidades físicas *</label><input class="input" type="number" name="qty" min="1" step="1" inputmode="numeric" required></div><div class="field"><label>Posición *</label><input class="input" name="position" inputmode="numeric" pattern="[0-9]+" placeholder="01" required></div></div><div class="field"><label>Caducidad * (MMAA)</label><input class="input" name="expiry" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" placeholder="0826" required><small>Ejemplo: 0826 = Agosto/2026</small></div><button type="submit" class="btn btn-primary btn-block">${I('check')} Guardar registro</button></form><div class="recount-saved"><h4>Mis registros del reconteo (${ownEntries.length})</h4>${ownEntries.map(e=>`<div class="recount-entry"><span>${e.qty===0?'No encontrado':`Pos. ${escapeHtml(e.position)} · ${formatDate(e.expiry)}`}</span><span><strong>${nfmt(e.qty)} und.</strong> <button class="btn btn-danger btn-icon btn-sm" data-action="delete-recount-entry" data-id="${escapeHtml(e.id)}" title="Eliminar registro">${I('trash')}</button></span></div>`).join('')||'<div class="small muted">Aún no hay registros guardados.</div>'}</div><div class="recount-buttons"><button class="btn btn-lime" data-action="finish-recount" data-id="${escapeHtml(active.skuId)}" ${ownEntries.length?'':'disabled'}>${I('check')} Finalizar reconteo</button><button class="btn btn-outline" data-action="release-recount" data-id="${escapeHtml(active.skuId)}">Liberar código</button>${ownEntries.length?'':`<button class="btn btn-outline" data-action="recount-no-stock" data-id="${escapeHtml(active.skuId)}">No encontré unidades</button>`}</div>`:'<div class="empty">Selecciona un código de la lista para comenzar. No verás cantidades del primer conteo ni stock teórico.</div>'}</section>${queue}</div></div>`;
 }
-function inventoryMarkup(){return `${header('Mi inventario','Administración del catálogo teórico y sus existencias.',`<button class="btn btn-primary" data-action="import-modal">${I('upload')} Carga inicial</button><button class="btn btn-lime" data-action="update-theory">${I('refresh')} Agregar stock por factura</button><button class="btn btn-outline" data-action="reconcile-existing-surplus">${I('check')} Conciliar fuera de stock</button><button class="btn btn-outline" data-action="new-product">${I('plus')} Nuevo producto</button>`)}<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Referencias',nfmt(STORE.products.length),'inventory')}${kpi('Unidades teóricas',nfmt(STORE.products.reduce((a,p)=>a+(Number(p.theoretical)||0),0)),'database')}${kpi('Costo declarado',money(STORE.products.reduce((a,p)=>a+(Number(p.costTotal)||0),0)),'dashboard')}</div><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Catálogo de productos</h3></div><button class="btn btn-outline btn-sm" data-action="export-inventory">${I('download')} Excel</button></div><div class="search-wrap" style="margin-bottom:13px">${I('search')}<input class="input" id="inventory-search" value="${escapeHtml(STATE.invQuery)}" placeholder="Buscar en todo el inventario…"></div><div id="inventory-table">${inventoryTable()}</div></section>${reviewPresentationMarkup()}`}
+function inventoryMarkup(){return `${header('Mi inventario','',`<button class="btn btn-primary" data-action="import-modal">${I('upload')} Carga inicial</button><button class="btn btn-lime" data-action="update-theory">${I('refresh')} Agregar stock por factura</button><button class="btn btn-outline" data-action="reconcile-existing-surplus">${I('check')} Conciliar fuera de stock</button><button class="btn btn-outline" data-action="new-product">${I('plus')} Nuevo producto</button>`)}<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Referencias',nfmt(STORE.products.length),'inventory')}${kpi('Unidades teóricas',nfmt(STORE.products.reduce((a,p)=>a+(Number(p.theoretical)||0),0)),'database')}${kpi('Costo declarado',money(STORE.products.reduce((a,p)=>a+(Number(p.costTotal)||0),0)),'dashboard')}</div><section class="surface pad" style="margin-bottom:17px;border-left:4px solid #08aee8"><div class="surface-head"><div><h3 class="surface-title">Sincronización con Atención al Cliente</h3></div><span class="pill green">Sin Cloud Functions</span></div><div class="toolbar" style="margin-top:12px"><button type="button" id="pfSyncPublish" class="btn btn-primary" data-pf-publish>Publicar inventario existente</button><button type="button" class="btn btn-outline" data-pf-open>Administrar PVP</button><button type="button" class="btn btn-outline" data-fraction-open>Venta por unidad</button><button type="button" class="btn btn-lime" data-pf-import-pvp>Importar PVP desde Excel</button></div><p id="pfSyncStatus" class="small muted" role="status" aria-live="polite" style="margin-top:12px">Inventario disponible: ${nfmt(STORE.products.length)} referencias. Estado de publicación: no verificado en esta sesión.</p></section><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Catálogo de productos</h3></div><button class="btn btn-outline btn-sm" data-action="export-inventory">${I('download')} Excel</button></div><div class="search-wrap" style="margin-bottom:13px">${I('search')}<input class="input" id="inventory-search" value="${escapeHtml(STATE.invQuery)}" placeholder="Buscar en todo el inventario…"></div><div id="inventory-table">${inventoryTable()}</div></section>${reviewPresentationMarkup()}`}
 function inventoryTable(){let rows=STORE.products.filter(p=>matches(p,STATE.invQuery));const lim=15,max=Math.max(1,Math.ceil(rows.length/lim));STATE.invPage=Math.max(0,Math.min(STATE.invPage,max-1));return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Categoría</th><th>Presentación</th><th class="right">Teórico</th><th class="right">Costo total</th><th class="right">Acciones</th></tr></thead><tbody>${rows.slice(STATE.invPage*lim,(STATE.invPage+1)*lim).map(p=>`<tr><td><div class="product-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div><span class="product-code">${escapeHtml(p.code)}</span></td><td>${escapeHtml(p.category||'Sin categoría')}</td><td>${escapeHtml(p.presentation||'—')}</td><td class="right bold">${nfmt(p.theoretical)}</td><td class="right">${money(p.costTotal)}</td><td><div class="actions-cell"><button class="btn btn-outline btn-icon" title="Editar" data-action="edit-product" data-id="${p.id}">${I('edit')}</button><button class="btn btn-danger btn-icon" title="Eliminar" data-action="delete-product" data-id="${p.id}">${I('trash')}</button></div></td></tr>`).join('')||`<tr><td colspan="6" class="empty">No hay coincidencias.</td></tr>`}</tbody></table></div>${pagination(rows.length,lim,STATE.invPage,'inv')}`}
 function expiryMarkup(){let c=[...STORE.counts.map(x=>({...x,product:STORE.products.find(p=>p.id===x.skuId)})),...STORE.surplus.map(x=>({...x,isSurplus:true,position:'—',product:{name:x.productName,code:x.code}}))].filter(x=>x.expiry&&validDate(x.expiry));const expir=c.filter(x=>daysTo(x.expiry)<0),d30=c.filter(x=>daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30),d60=c.filter(x=>daysTo(x.expiry)>30&&daysTo(x.expiry)<=60),d90=c.filter(x=>daysTo(x.expiry)>60&&daysTo(x.expiry)<=90);let filtered=c.filter(x=>(STATE.expiryRange==='all'||(STATE.expiryRange==='expired'&&daysTo(x.expiry)<0)||(STATE.expiryRange==='30'&&daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30)||(STATE.expiryRange==='60'&&daysTo(x.expiry)>30&&daysTo(x.expiry)<=60)||(STATE.expiryRange==='90'&&daysTo(x.expiry)>60&&daysTo(x.expiry)<=90))&&matches(x.product||{},STATE.expiryQuery,[x.position,x.expiry,x.name].join(' '))).sort((a,b)=>a.expiry.localeCompare(b.expiry));return `${header('Caducidades','Control de fechas de vencimiento a partir de los conteos físicos registrados.',`<button class="btn btn-outline" data-action="export-expiry">${I('download')} Exportar reporte</button>`)}<div class="kpi-grid">${kpi('Vencidos',nfmt(expir.reduce((a,x)=>a+Number(x.qty),0)),'alert','red',`${expir.length} registros`)}${kpi('Próx. 30 días',nfmt(d30.reduce((a,x)=>a+Number(x.qty),0)),'clock','amber',`${d30.length} registros`)}${kpi('Entre 31 y 60',nfmt(d60.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}${kpi('Entre 61 y 90',nfmt(d90.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}</div><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Vencimientos por caja</h3></div></div><div class="toolbar" style="margin-bottom:13px"><div class="search-wrap">${I('search')}<input class="input" id="expiry-search" placeholder="Buscar producto, código, caja o colaborador…" value="${escapeHtml(STATE.expiryQuery)}"></div><select class="select" id="expiry-range"><option value="all">Todas las fechas</option><option value="expired" ${STATE.expiryRange==='expired'?'selected':''}>Vencidos</option><option value="30" ${STATE.expiryRange==='30'?'selected':''}>0–30 días</option><option value="60" ${STATE.expiryRange==='60'?'selected':''}>31–60 días</option><option value="90" ${STATE.expiryRange==='90'?'selected':''}>61–90 días</option></select></div><div id="expiry-table">${expiryTable(filtered)}</div></section>`}
 function expiryTable(rows){return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Posición</th><th class="right">Cantidad</th><th>Caducidad</th><th>Estado</th><th>Colaborador</th><th class="right">Acciones</th></tr></thead><tbody>${rows.slice(0,120).map(c=>{let days=daysTo(c.expiry),cls=days<0?'missing':days<=30?'extra':'ok';return `<tr><td><div class="product-name" title="${escapeHtml(c.product?.name||'Producto no encontrado')}">${escapeHtml(c.product?.name||'Producto no encontrado')}</div><span class="product-code">${escapeHtml(c.product?.code||'—')}</span></td><td>${escapeHtml(c.position||'—')}</td><td class="right bold">${nfmt(c.qty)}</td><td>${formatDate(c.expiry)}</td><td><span class="state ${cls}">${days<0?'Vencido':days===0?'Vence hoy':days+' días'}</span></td><td>${escapeHtml(c.name)}</td><td class="right"><button class="btn btn-outline btn-icon" title="Editar registro" data-action="${c.isSurplus?'edit-surplus':'edit-count'}" data-id="${c.id}">${I('edit')}</button> <button class="btn btn-danger btn-icon" title="Borrar registro" data-action="${c.isSurplus?'delete-surplus':'delete-count'}" data-id="${c.id}">${I('trash')}</button></td></tr>`}).join('')||`<tr><td class="empty" colspan="7">Sin registros para este filtro.</td></tr>`}</tbody></table></div>${rows.length>120?`<p class="small muted" style="margin-top:12px">Se muestran los primeros 120 registros. Utiliza el buscador o exporta el reporte completo.</p>`:''}`}
-function usersMarkup(){let arr=STORE.profiles.filter(p=>p.role==='supervisor');return `${header('Usuarios y accesos','Administra los accesos administrativos desde la propia página.',`<button class="btn btn-primary" data-action="new-admin">${I('plus')} Crear supervisor</button>`)}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Supervisores</h3></div><span class="pill">${arr.length} usuarios</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Nombre</th><th>Usuario</th><th>Estado</th><th class="right">Acciones</th></tr></thead><tbody>${arr.length?arr.map(p=>`<tr><td><div style="display:flex;align-items:center;gap:9px">${avatar(p.displayName)}<strong>${escapeHtml(p.displayName||p.username)}</strong></div></td><td>${escapeHtml(p.username)}</td><td><span class="state ${p.active===false?'missing':'ok'}">${p.active===false?'Inactivo':'Activo'}</span></td><td><div class="actions-cell"><button class="btn btn-outline btn-sm" data-action="change-pass" data-id="${p.id}" title="Cambiar contraseña">${I('lock')} Contraseña</button><button class="btn ${p.active===false?'btn-soft':'btn-danger'} btn-sm" data-action="toggle-user" data-id="${p.id}" ${p.id===STORE.uid?'disabled':''}>${p.active===false?'Activar':'Desactivar'}</button></div></td></tr>`).join(''):`<tr><td class="empty" colspan="4">Todavía no se crearon supervisores.</td></tr>`}</tbody></table></div></section><section class="surface pad reset-section" style="margin-top:18px"><div class="surface-head"><div><h3 class="surface-title">Reiniciar inventario</h3></div><span class="pill red">Zona de mantenimiento</span></div><p class="small muted" style="margin:0 0 16px">Elimina las pruebas guardadas en Firebase. Los usuarios de Supervisión se conservan.</p><div class="reset-actions"><button class="btn btn-outline" data-action="reset-modal" data-mode="counts">${I('trash')} Borrar conteos</button><button class="btn btn-outline" data-action="reset-modal" data-mode="catalog">${I('inventory')} Borrar inventario actual</button><button class="btn btn-danger" data-action="reset-modal" data-mode="all">${I('alert')} Reiniciar todo</button></div><p class="small muted" style="margin-top:12px">Estas acciones son irreversibles. Exporta tus datos primero si deseas conservarlos.</p></section>`}
+function usersMarkup(){let arr=STORE.profiles.filter(p=>p.role==='supervisor');return `${header('Usuarios y accesos','Administra los accesos administrativos desde la propia página.',`<button class="btn btn-primary" data-action="new-admin">${I('plus')} Crear supervisor</button>`)}<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Supervisores</h3></div><span class="pill">${arr.length} usuarios</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Nombre</th><th>Usuario</th><th>Estado</th><th class="right">Acciones</th></tr></thead><tbody>${arr.length?arr.map(p=>`<tr><td><div style="display:flex;align-items:center;gap:9px">${avatar(p.displayName)}<strong>${escapeHtml(p.displayName||p.username)}</strong></div></td><td>${escapeHtml(p.username)}</td><td><span class="state ${p.active===false?'missing':'ok'}">${p.active===false?'Inactivo':'Activo'}</span></td><td><div class="actions-cell"><button class="btn btn-outline btn-sm" data-action="change-pass" data-id="${p.id}" title="Cambiar contraseña">${I('lock')} Contraseña</button><button class="btn ${p.active===false?'btn-soft':'btn-danger'} btn-sm" data-action="toggle-user" data-id="${p.id}" ${p.id===STORE.uid?'disabled':''}>${p.active===false?'Activar':'Desactivar'}</button></div></td></tr>`).join(''):`<tr><td class="empty" colspan="4">Todavía no se crearon supervisores.</td></tr>`}</tbody></table></div></section>${pfWorkerDirectoryMarkup()}<section class="surface pad reset-section" style="margin-top:18px"><div class="surface-head"><div><h3 class="surface-title">Reiniciar inventario</h3></div><span class="pill red">Zona de mantenimiento</span></div><p class="small muted" style="margin:0 0 16px">Elimina las pruebas guardadas en Firebase. Los usuarios de Supervisión se conservan.</p><div class="reset-actions"><button class="btn btn-outline" data-action="reset-modal" data-mode="counts">${I('trash')} Borrar conteos</button><button class="btn btn-outline" data-action="reset-modal" data-mode="catalog">${I('inventory')} Borrar inventario actual</button><button class="btn btn-danger" data-action="reset-modal" data-mode="all">${I('alert')} Reiniciar todo</button></div><p class="small muted" style="margin-top:12px">Estas acciones son irreversibles. Exporta tus datos primero si deseas conservarlos.</p></section>`}
 
 function locationMatches(query){
  const q=String(query||'').trim();if(!q)return [];
@@ -1338,7 +1389,7 @@ function showLocationAdminEditor(skuId){
 }
 function supervisorLocationsMarkup(){
  const stamp=STORE.locationsSyncedAt?locationStamp(new Date(STORE.locationsSyncedAt).toISOString()):'Sin actualizar';
- return `${header('Ubicaciones','',`<button class="btn btn-outline" data-action="loc-admin-refresh">${I('refresh')} Actualizar</button><button class="btn btn-primary" data-action="loc-admin-export">${I('download')} Excel</button>`)}
+ return `${header('Ubicaciones','',`<button class="btn btn-outline" data-action="loc-admin-refresh">${I('refresh')} Actualizar</button><button class="btn btn-outline" data-action="loc-copy-map">${I('copy')} Copiar mapeo</button><button class="btn btn-primary" data-action="loc-admin-export">${I('download')} Excel</button>`)}
  <div id="super-loc-stats">${locationAdminSummary()}</div>
  <section class="surface pad"><div class="surface-head"><h2 class="surface-title">Asignaciones registradas</h2><span id="super-loc-sync" class="small muted">Consulta: ${escapeHtml(stamp)}</span></div>
  <div class="loc-admin-filters"><div class="search-wrap">${I('search')}<input class="input" id="super-loc-search" value="${escapeHtml(STATE.locationAdminQuery)}" placeholder="Buscar código, producto, ubicación o colaborador"></div><select class="input" id="super-loc-filter"><option value="assigned" ${STATE.locationAdminFilter==='assigned'?'selected':''}>Ubicados</option><option value="pending" ${STATE.locationAdminFilter==='pending'?'selected':''}>Sin ubicación</option><option value="all" ${STATE.locationAdminFilter==='all'?'selected':''}>Todos</option></select></div>
@@ -1372,7 +1423,7 @@ function locationsConsultMarkup(){
 function locationsWorkerMarkup(){
  const valid=new Set(STORE.products.map(p=>p.id));
  const recent=STORE.locations.filter(x=>valid.has(x.skuId)).slice().sort((a,b)=>String(b.updatedAt||'').localeCompare(String(a.updatedAt||''))).slice(0,8);
- return `<main class="loc-shell"><header class="loc-header">${logo()}<div class="toolbar">${badgeConnection()}<button class="btn btn-outline btn-sm" data-action="loc-view-toggle" title="${STATE.locationView==='consult'?'Volver a asignar':'Consultar ubicaciones'}">${I(STATE.locationView==='consult'?'pin':'search')} ${STATE.locationView==='consult'?'Asignar':'Consultar'}</button><button class="btn btn-outline btn-sm" data-action="loc-refresh" title="Volver a consultar ubicaciones">${I('refresh')} Actualizar</button><button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header>
+ return `<main class="loc-shell"><header class="loc-header">${logo()}<div class="toolbar">${badgeConnection()}<button class="btn btn-outline btn-sm" data-action="loc-view-toggle" title="${STATE.locationView==='consult'?'Volver a asignar':'Consultar ubicaciones'}">${I(STATE.locationView==='consult'?'pin':'search')} ${STATE.locationView==='consult'?'Asignar':'Consultar'}</button><button class="btn btn-outline btn-sm" data-action="loc-copy-map" title="Copiar todas las ubicaciones asignadas">${I('copy')} Copiar mapeo</button><button class="btn btn-outline btn-sm" data-action="loc-refresh" title="Volver a consultar ubicaciones">${I('refresh')} Actualizar</button><button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header>
  <h1 class="loc-title">Mis Ubicaciones</h1><div class="loc-metrics" id="loc-metrics">${locationStatsMarkup()}</div>
  ${STATE.locationView==='consult'?locationsConsultMarkup():`<div class="loc-grid"><section class="surface pad"><h2 class="surface-title">Buscar producto</h2><div class="field"><label>Nombre o código</label><input class="input" id="loc-search" placeholder="Nombre o código" value="${escapeHtml(STATE.locationQuery)}" autocomplete="off"></div><div id="loc-results" class="loc-search-results">${locationsSuggestions()}</div></section>
  <section class="surface pad"><h2 class="surface-title">Asignar ubicación</h2><div id="loc-assignment">${locationAssignmentMarkup()}</div></section></div>
@@ -1410,7 +1461,7 @@ function resetModal(mode){
 function invoiceUpdateModal(){
  if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected){notify('Abre Supervisión y espera a que Firebase esté conectado antes de actualizar.','error');return}
  INVOICE_REVIEW=null;
- showModal('Agregar stock desde factura',`<form class="form-stack" data-form="invoice-upload"><div class="note"><b>Esta operación SUMA, no reemplaza.</b> Los códigos existentes aumentan sus unidades teóricas, los nuevos se incorporan al catálogo y los demás quedan intactos. No modifica conteos, reconteos, ubicaciones ni PVP.</div><div class="import-zone">${I('file')}<b>Selecciona tu consolidado de facturas</b><span class="small muted">Excel (.xlsx / .xls) o CSV. Encabezados esperados: Código de barras, Ítem / Producto y Cantidad.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div><div class="invoice-note">La columna Cantidad puede representar cajas. Revisaremos los factores x6, x50, x100 antes de convertir a unidades. No se aplican multiplicaciones silenciosas.</div><div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button class="btn btn-primary" type="submit">Comparar con mi inventario</button></div></form>`);
+ showModal('Agregar stock desde factura',`<form class="form-stack" data-form="invoice-upload"><div class="note"><b>Esta operación SUMA y publica en Atención al Cliente.</b> Los códigos existentes aumentan sus unidades teóricas, los nuevos se incorporan al catálogo y los demás quedan intactos. No modifica conteos, reconteos, ubicaciones ni PVP.</div><div class="import-zone">${I('file')}<b>Selecciona tu consolidado de facturas</b><span class="small muted">Excel (.xlsx / .xls) o CSV. Encabezados esperados: Código de barras, Ítem / Producto y Cantidad.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div><div class="invoice-note">La columna Cantidad puede representar cajas. Revisaremos los factores x6, x50, x100 antes de convertir a unidades. No se aplican multiplicaciones silenciosas.</div><div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button class="btn btn-primary" type="submit">Comparar con mi inventario</button></div></form>`);
 }
 async function invoiceRawRows(file){
  if(file.name.toLowerCase().endsWith('.csv'))return csvParse(await file.text());
@@ -1561,13 +1612,13 @@ async function invoiceApply(){
  const ps=invoicePlannedProducts();if(!ps.length)throw Error('No hay productos.');
  const nNew=INVOICE_REVIEW.items.filter(a=>a.targetId==='NEW').length;
  const units=INVOICE_REVIEW.items.reduce((sum,a)=>sum+invoiceProposedQty(a),0);
- if(!confirm(`SUMAR ${units} unidades correspondientes a ${ps.length} productos (${nNew} nuevos) en Firebase? Los códigos existentes NO se reemplazarán. Los conteos y ubicaciones permanecen intactos. No vuelvas a subir la misma factura.`))return;
+ if(!confirm(`SUMAR ${units} unidades correspondientes a ${ps.length} productos (${nNew} nuevos) y PUBLICAR esos productos en Atención al Cliente? Los códigos existentes NO se reemplazarán. Los conteos y ubicaciones permanecen intactos.`))return;
  const btn=document.getElementById('invoice-apply-button');if(btn)btn.disabled=true;
  let result;
  try{result=await adapter.applyInvoiceAdditions(INVOICE_REVIEW,(a,b)=>{const el=document.getElementById('invoice-validation');if(el)el.textContent=`Sumando stock en Firebase: ${a} de ${b} referencias. No cierres esta página.`;});}
  catch(e){if(btn)btn.disabled=false;throw Error('La carga se interrumpió. Los productos confirmados NO se duplicarán si repites exactamente el MISMO archivo. Sin cambiar el archivo, espera la sincronización y vuelve a comparar. '+e.message)}
  INVOICE_REVIEW.applied=true;
- notify(`Factura procesada: ${result.added} producto(s) sumados, ${result.skipped} ya habían sido incluidos. Conteos y ubicaciones intactos.`);
+ notify(`Factura confirmada: ${result.added} producto(s) sumados y publicados en Atención al Cliente, ${result.skipped} ya procesados. Conteos y ubicaciones intactos.`);
  invoiceReconcileModal();
 }
 function invoiceLinkCandidates(){
@@ -1625,14 +1676,27 @@ async function mapRows(rows){const map=new Map();for(const row of rows){let rowO
 // Mantiene códigos de barras, SKU y posiciones como TEXTO para conservar ceros iniciales.
 let pfXlsxLoader=null;
 async function pfEnsureXlsx(){
- if(window.XLSX?.utils?.aoa_to_sheet)return window.XLSX;
- if(!pfXlsxLoader)pfXlsxLoader=new Promise((resolve,reject)=>{
-   const script=document.createElement('script');
-   script.src='https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
-   script.onload=()=>window.XLSX?.utils?.aoa_to_sheet?resolve(window.XLSX):reject(Error('No se pudo iniciar Excel.'));
-   script.onerror=()=>reject(Error('No se pudo cargar el generador de Excel. Revisa la conexión a Internet.'));
-   document.head.appendChild(script);
- }).catch(err=>{pfXlsxLoader=null;throw err});
+ if(window.XLSX?.read && window.XLSX?.utils?.sheet_to_json)return window.XLSX;
+ if(!pfXlsxLoader)pfXlsxLoader=(async()=>{
+   const sources=[
+     'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
+     'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+     'https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js',
+     'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js'
+   ];
+   for(const source of sources){
+     try{
+       await new Promise((resolve,reject)=>{
+         const script=document.createElement('script');script.src=source;script.async=true;
+         script.onload=()=>window.XLSX?.read?resolve():reject(Error('Biblioteca incompatible'));
+         script.onerror=()=>reject(Error('Servidor no disponible'));
+         document.head.appendChild(script);
+       });
+       if(window.XLSX?.utils?.sheet_to_json)return window.XLSX;
+     }catch(e){/* probar otra fuente */}
+   }
+   throw Error('No se pudo cargar el lector de Excel desde Internet. Abre esta web con conexión y prueba nuevamente.');
+ })().catch(err=>{pfXlsxLoader=null;throw err});
  return pfXlsxLoader;
 }
 function pfExcelCell(value,key){
@@ -1708,7 +1772,7 @@ if(e.target.id==='select-all-novelties'){
   document.querySelectorAll('input[data-action="select-novelty"]').forEach(box=>{box.checked=STATE.recountSelection.has(box.dataset.id)});
  }if(e.target.id==='count-mode')updateUnitControls();if(e.target.id==='dashboard-status'){STATE.status=e.target.value;STATE.page=0;updateTables()}if(e.target.id==='expiry-range'){STATE.expiryRange=e.target.value;updateTables()}});
 document.addEventListener('click',async e=>{let b=e.target.closest('[data-action]');if(!b)return;let action=b.dataset.action,id=b.dataset.id;try{
- if(action==='loc-view-toggle'){
+ if(action==='pf-delete-worker'){if(STORE.role!=='supervisor')throw Error('Solo Supervisión.');const n=PF_WORKER_NAMES[Number(id)];if(n&&confirm('¿Eliminar a '+n+' de la lista de selección?')){await pfSaveWorkerNames(PF_WORKER_NAMES.filter(x=>x!==n));notify('Colaborador retirado de la lista.');}}else if(action==='loc-view-toggle'){
    if(STORE.role!=='locations')throw Error('Solo disponible en Ubicaciones.');
    STATE.locationView=STATE.locationView==='consult'?'assign':'consult';render();
    document.getElementById(STATE.locationView==='consult'?'loc-consult-input':'loc-search')?.focus({preventScroll:true});
@@ -1736,6 +1800,15 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    if(STORE.appMode==='firebase'&&STORE.locationsLoaded&&locationRemoteFetchedAt&&Date.now()-locationRemoteFetchedAt<LOCATIONS_REFRESH_GAP_MS){notify('Consulta reciente. Espera unos segundos para actualizar nuevamente.');return;}
    if(STORE.appMode==='firebase')await adapter.loadLocations(true);else await adapter.loadLocations();
    updateSupervisorLocationsView();notify('Panel de ubicaciones actualizado.');
+ }else if(action==='loc-copy-map'){
+   if(!['supervisor','locations'].includes(STORE.role)||!STORE.locationsLoaded)throw Error('Carga primero las ubicaciones.');
+   const bySku=new Map(STORE.locations.map(x=>[x.skuId,x]));
+   const rows=STORE.products.map(p=>({p,loc:bySku.get(p.id)})).filter(x=>x.loc?.location&&validLocationCode(x.loc.location)).map(({p,loc})=>({codigo:String(p.code||'').trim(),producto:String(p.name||'').trim(),ubicacion:String(loc.location).trim().toUpperCase()}));
+   if(!rows.length)throw Error('No hay ubicaciones asignadas para copiar.');
+   const payload=JSON.stringify({formato:'PUNTOFARMA_UBICACIONES_V1',fecha:new Date().toISOString(),ubicaciones:rows});
+   if(!navigator.clipboard?.writeText)throw Error('Portapapeles no disponible; abre la web con HTTPS.');
+   await navigator.clipboard.writeText(payload);
+   notify(`${rows.length} ubicaciones copiadas. Abre Atención al Cliente → Configuración → Pegar ubicaciones.`);
  }else if(action==='loc-admin-export'){
    if(STORE.role!=='supervisor'||!STORE.locationsLoaded)throw Error('Carga primero las ubicaciones.');
    await exportXlsx(locationAdminRows().map(({p,loc})=>({codigo:p.code,producto:p.name,ubicacion:loc?.location||'',colaborador:loc?.name||'',modificado:loc?.updatedAt||''})),`puntofarma_ubicaciones_${localToday()}.xlsx`);
@@ -1863,7 +1936,7 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    await navigator.clipboard.writeText(data);notify(`${rows.length} filas copiadas.`);
  }else if(action==='download-filter'){
    await exportXlsx(filteredRowsCSV(),`puntofarma_${STATE.status}_${localToday()}.xlsx`);
- }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;if(STORE.appMode==='firebase'&&STORE.role==='supervisor'&&refreshSupervisorFeeds)refreshSupervisorFeeds(STATE.panel);render();if(STATE.panel==='locations'&&!STATE.locationSupervisorRequested){STATE.locationSupervisorRequested=true;adapter.loadLocations(STORE.appMode==='firebase').catch(err=>{console.error('Ubicaciones / supervisión',err);notify('No se pudieron cargar ubicaciones: '+String(err.message||err),'error')});}}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
+ }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render();if(['operator','recount','locations'].includes(STATE.loginType))await pfLoadWorkerNames()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;if(STORE.appMode==='firebase'&&STORE.role==='supervisor'&&refreshSupervisorFeeds)refreshSupervisorFeeds(STATE.panel);render();if(STATE.panel==='locations'&&!STATE.locationSupervisorRequested){STATE.locationSupervisorRequested=true;adapter.loadLocations(STORE.appMode==='firebase').catch(err=>{console.error('Ubicaciones / supervisión',err);notify('No se pudieron cargar ubicaciones: '+String(err.message||err),'error')});}}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
  else if(action==='review-units'){showUnitReview(id)}else if(action==='keep-theory'){const p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto no encontrado.');if(!confirm('¿Confirmas que el teórico actual está expresado en unidades y NO debe multiplicarse? Se mantendrá la diferencia física.'))return;await adapter.updateProduct(id,{unitReviewResolved:true});closeModal();notify('Confirmado: teórico conservado como unidades.');if(STORE.appMode==='demo')render()}else if(action==='edit-product'){showProductEditor(id)}else if(action==='new-product'){showProductEditor(null)}else if(action==='delete-product'){let p=STORE.products.find(x=>x.id===id);if(!confirm(`¿Eliminar ${p?.name||'este producto'} del catálogo? También se retirará de Reconteo si está enviado. Los conteos históricos se conservarán.`))return;await adapter.deleteProduct(id);notify('Producto eliminado del catálogo y retirado de Reconteo.');if(STORE.appMode==='demo')render()}
  else if(action==='update-theory'){invoiceUpdateModal()}else if(action==='reconcile-existing-surplus'){INVOICE_REVIEW={items:[],applied:true,links:[]};invoiceReconcileModal()}else if(action==='invoice-suggested'){invoiceBulkSuggested()}else if(action==='invoice-assume-units'){invoiceBulkSingle()}else if(action==='invoice-backup'){invoiceBackup()}else if(action==='invoice-preview-export'){await invoiceExportPreview()}else if(action==='invoice-link-review'){invoiceRenderLinks()}else if(action==='invoice-link-toggle'){invoiceToggleLink(id,b.checked)}else if(action==='invoice-link-all'){invoiceSelectSafeLinks()}else if(action==='invoice-link-none'){invoiceClearLinks()}else if(action==='invoice-manual-link'){invoiceManualLinkModal(id)}else if(action==='invoice-previous'){INVOICE_REVIEW.current=Math.max(0,INVOICE_REVIEW.current-1);invoiceRenderReview()}else if(action==='invoice-next'){INVOICE_REVIEW.current++;invoiceRenderReview()}else if(action==='import-modal'){importModal()}else if(action==='reset-modal'){resetModal(b.dataset.mode)}else if(action==='new-admin'){modalNewAdmin()}else if(action==='change-pass'){modalPassword(id)}else if(action==='toggle-user'){if(!confirm('¿Cambiar el estado de este acceso?'))return;await adapter.toggleUser(id);notify('Estado actualizado.');if(STORE.appMode==='demo')render()}
  else if(action==='export-surplus'){await exportXlsx(surplusCSV(),'puntofarma_sobrantes_manuales.xlsx')}else if(action==='export-counts'){await exportXlsx(countCSV(),'puntofarma_conteos.xlsx')}else if(action==='export-expiry'){await exportXlsx([...STORE.counts.map(c=>{const p=STORE.products.find(x=>x.id===c.skuId);return {codigo:p?.code||'',producto:p?.name||'',colaborador:c.name,posicion:c.position,cantidad:c.qty,caducidad:formatDate(c.expiry),registro:c.createdAt||'',origen:'Conteo físico'}}).filter(x=>x.caducidad),...surplusCSV()],'puntofarma_caducidades.xlsx')}else if(action==='export-inventory'){await exportXlsx(STORE.products.map(p=>({codigo:p.code,producto:p.name,categoria:p.category,presentacion:p.presentation,teorico:p.theoretical,costoTotal:p.costTotal})),'puntofarma_inventario.xlsx')}
@@ -1871,6 +1944,7 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
  }catch(err){notify(err.message||'Ocurrió un error.','error')}});
 document.addEventListener('submit',async e=>{let form=e.target.closest('form[data-form]');if(!form)return;e.preventDefault();if(STATE.busy)return;if(['count','surplus','recount-count'].includes(form.dataset.form))prepareSound();STATE.busy=true;let btn=form.querySelector('[type=submit],button:not([type])'),fd=Object.fromEntries(new FormData(form));if(btn)btn.disabled=true;try{
  switch(form.dataset.form){
+ case 'pf-add-worker':{const name=String(fd.displayName||'').replace(/\s+/g,' ').trim();if(name.length<3)throw Error('Ingresa nombre y apellido.');if(PF_WORKER_NAMES.some(x=>x.toLocaleLowerCase('es')===name.toLocaleLowerCase('es')))throw Error('El nombre ya está registrado.');await pfSaveWorkerNames([...PF_WORKER_NAMES,name]);notify('Colaborador agregado.');break;} 
  case 'location-admin-save':{
    if(STORE.role!=='supervisor')throw Error('Acción exclusiva de Supervisión.');
    if(!STORE.locationsLoaded)throw Error('Espera a que se carguen las ubicaciones.');
@@ -1899,7 +1973,7 @@ document.addEventListener('submit',async e=>{let form=e.target.closest('form[dat
    break;
  }
  case 'first-admin':{let name=String(fd.username||'').trim().toLowerCase();loginEmail(name);let u=await adapter.createFirst(name,String(fd.password),String(fd.displayName));STORE.user=u;appEnter('supervisor',u);notify('Supervisor configurado.');break}
- case 'admin-login':{let user=await adapter.authenticate(String(fd.username||''),String(fd.password||''));appEnter('supervisor',user);notify('Acceso autorizado.');break}
+ case 'admin-login':{let user=await adapter.authenticate(String(fd.username||''),String(fd.password||''));appEnter('supervisor',user);await pfLoadWorkerNames();notify('Acceso autorizado.');break}
  case 'worker-login':{let name=String(fd.displayName||'').trim().replace(/\s+/g,' ');if(name.length<3)throw Error('Ingresa al menos 3 caracteres.');let u=await adapter.loginWorker(name);appEnter(STATE.loginType==='recount'?'recount':STATE.loginType==='locations'?'locations':'operator',u);notify('Sesión iniciada.');break}
  case 'recount-count':{
    const task=STORE.recounts.find(t=>t.status==='in_progress'&&t.assignedUid===STORE.uid);
@@ -1945,7 +2019,7 @@ document.addEventListener('submit',async e=>{let form=e.target.closest('form[dat
  case 'invoice-apply':{await invoiceApply();break}
  case 'invoice-links':{await invoiceApplyLinks();break}
  case 'invoice-manual-link':{await invoiceSaveManualLink(fd);break}
- case 'import':{if(STORE.counts.length||STORE.surplus.length)throw Error('Ya existen conteos. Para facturas utiliza Agregar stock por factura: suma existencias sin alterar conteos.');let file=form.querySelector('input[type="file"]')?.files?.[0];if(!file)throw Error('Selecciona el archivo.');notify('Leyendo archivo…');let products=await parseExcel(file);if(!products.length)throw Error('No se detectaron productos con código y nombre.');await adapter.upsertProducts(products);closeModal();notify(`${products.length} productos importados/actualizados; conteos conservados.`);if(STORE.appMode==='demo')render();break}
+ case 'import':{if(STORE.counts.length||STORE.surplus.length)throw Error('Ya existen conteos. Para facturas utiliza Actualizar stock teórico, que preserva los registros y evita duplicados.');let file=form.querySelector('input[type="file"]')?.files?.[0];if(!file)throw Error('Selecciona el archivo.');notify('Leyendo archivo…');let products=await parseExcel(file);if(!products.length)throw Error('No se detectaron productos con código y nombre.');await adapter.upsertProducts(products);closeModal();notify(`${products.length} productos importados/actualizados; conteos conservados.`);if(STORE.appMode==='demo')render();break}
  case 'first-firebase':{let initial=await adapter.createFirst(String(fd.username||'').trim().toLowerCase(),String(fd.password||''),String(fd.displayName||''));showModal('Activa tu primer supervisor',`<div class="note">Cuenta creada. Para impedir que cualquier visitante se convierta en supervisor, debes autorizar este UID una sola vez en Firebase → Firestore.</div><div class="field" style="margin-top:15px"><label>UID de Authentication</label><input class="input" readonly value="${escapeHtml(initial.id)}" onclick="this.select()"></div><div class="note">Crea <strong>profiles / ${escapeHtml(initial.id)}</strong> con los campos:<br><code>role</code> = supervisor<br><code>username</code> = ${escapeHtml(initial.username)}<br><code>displayName</code> = ${escapeHtml(initial.displayName)}<br><code>active</code> = true (booleano).<br><br>Después vuelve e inicia sesión con tu usuario y contraseña.</div>`);break}
  }
  }catch(err){notify(err?.message||'No se pudo guardar.','error')}finally{STATE.busy=false;if(btn&&btn.isConnected)btn.disabled=false}});
@@ -1963,8 +2037,173 @@ async function bootstrap(){
  render();
 }
 bootstrap();
+
+/* PUNTOFARMA: PVP administrado exclusivamente por supervisor.
+   pvp vive en stock/{skuId}; Supervisión publica la vista de consulta en el mismo lote de escritura. */
+(()=>{
+'use strict';
+const $id=id=>document.getElementById(id);
+function serviceProjection(p){
+ const price=p.pvp!=null?p.pvp:(p.pvpUnit!=null&&Number(p.pvpUnit)>0?p.pvpUnit:null);
+ return {code:String(p.code||''),name:String(p.name||''),qty:Math.max(0,Number(p.theoretical)||0),pvp:price==null?null:Number(price),category:String(p.category||''),presentation:String(p.presentation||''),fractionAllowed:p.fractionAllowed===true,fractionUnits:Number(p.fractionUnits||0),fractionPvp:p.fractionPvp==null?null:Number(p.fractionPvp),fractionOverride:p.fractionOverride===true,updatedAt:new Date().toISOString()};
+}
+let current=[],chosen=null;
+function ensure(){
+ if($id('pfpvpDialog'))return;
+
+ const dialog=document.createElement('div');dialog.id='pfpvpDialog';dialog.style.cssText='display:none;position:fixed;inset:0;z-index:110;background:#172c3f99;padding:20px;overflow:auto';
+ dialog.innerHTML=`<section style="max-width:850px;margin:5vh auto;background:white;padding:22px;border-radius:16px;color:#16364b"><header style="display:flex;justify-content:space-between;gap:14px"><h2>Administrar PVP · Supervisión</h2><button id="pfpvpClose" style="padding:8px 13px">Cerrar</button></header><input id="pfpvpSearch" placeholder="Buscar código o producto" style="width:100%;padding:12px;border:1px solid #bdd5df;border-radius:10px"><div id="pfpvpRows" style="max-height:55vh;overflow:auto;margin-top:12px"></div><p id="pfpvpMsg" style="font-size:12px;color:#087fac;margin-top:10px"></p></section>`;
+ document.body.append(dialog);$id('pfpvpClose').onclick=()=>dialog.style.display='none';$id('pfpvpSearch').oninput=render;
+}
+function ready(){return typeof STORE!=='undefined'&&STORE.role==='supervisor'&&STORE.ready&&typeof fb!=='undefined'&&!!fb}
+function show(){if(!ready())return;$id('pfpvpDialog').style.display='block';$id('pfpvpSearch').value='';render()}
+function render(){if(!ready())return;const q=($id('pfpvpSearch').value||'').toLocaleUpperCase().trim();const products=STORE.products.filter(p=>!q||String(p.code||'').toUpperCase().includes(q)||String(p.name||'').toUpperCase().includes(q)).slice(0,80);
+ $id('pfpvpRows').innerHTML=products.map(p=>`<div style="display:flex;align-items:center;gap:10px;border-bottom:1px solid #e3edf2;padding:10px 2px;flex-wrap:wrap"><div style="flex:1;min-width:220px"><b>${escapeHtml(String(p.name||''))}</b><small style="display:block;color:#79909b">${escapeHtml(String(p.code||''))} · ${escapeHtml(p.id)}</small></div><label>PVP $ <input data-pfprice="${escapeHtml(p.id)}" type="number" step="0.01" min="0" placeholder="Pendiente" value="${p.pvp!=null&&Number(p.pvp)>0?Number(p.pvp).toFixed(2):''}" style="width:100px;padding:8px;border:1px solid #c8dce4;border-radius:7px"></label><button data-pfsave="${escapeHtml(p.id)}" style="padding:10px;border:0;background:#0786b5;color:white;border-radius:8px">Guardar</button></div>`).join('')||'<p>No hay coincidencias.</p>';
+ $id('pfpvpRows').querySelectorAll('[data-pfsave]').forEach(b=>b.onclick=()=>savePvp(b.dataset.pfsave));}
+function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function savePvp(id){if(!ready())return;const input=[...$id('pfpvpRows').querySelectorAll('input[data-pfprice]')].find(x=>x.dataset.pfprice===id);const raw=input.value.trim();const amount=raw===''?null:Number(raw);if(amount!==null&&(!Number.isFinite(amount)||amount<0||amount>999999)){$id('pfpvpMsg').textContent='PVP inválido.';return}
+ const p=STORE.products.find(p=>p.id===id);if(!p)return;const original=$id('pfpvpMsg');original.textContent='Guardando...';
+ try{const batch=fb.fsm.writeBatch(fb.db);batch.update(fb.fsm.doc(fb.db,'stock',id),{pvp:amount,pvpUpdatedAt:new Date().toISOString()});batch.set(fb.fsm.doc(fb.db,'service_products',id),serviceProjection({...p,pvp:amount}));await batch.commit();p.pvp=amount;original.textContent='PVP guardado y sincronizado con Atención al Cliente.';render()}
+ catch(e){original.textContent='No se pudo guardar: '+(e.message||e)} }
+// Importación exclusivamente de PVP: ninguna operación modifica el inventario físico, stock ni ubicaciones.
+const pfNormalize=v=>String(v??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/[^A-Z0-9]+/g,' ').trim();
+let pfPriceRows=[],pfReviewRows=[],pfOriginalRows=[];
+function ensurePvpImport(){
+ if($id('pfImportPvpDialog'))return;
+ const el=document.createElement('div');el.id='pfImportPvpDialog';el.style.cssText='display:none;position:fixed;inset:0;z-index:115;background:#172c3f99;overflow:auto;padding:18px';
+ el.innerHTML=`<section style="background:#fff;border-radius:17px;padding:22px;max-width:1100px;margin:3vh auto;color:#15334a"><header style="display:flex;justify-content:space-between;gap:12px"><h2>Importar únicamente PVP</h2><button id="pfImportClose" class="btn btn-outline">Cerrar</button></header><input id="pfImportFile" type="file" accept=".xlsx,.xls" class="input" style="padding:12px;height:auto"><div id="pfImportSummary" style="margin:15px 0;color:#446578" role="status">Selecciona el Excel para revisar los precios.</div><div id="pfImportTabs" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"><button class="btn btn-outline" type="button" data-pf-tab="changes">Listos para actualizar</button><button class="btn btn-outline" type="button" data-pf-tab="review">Revisar coincidencias</button><button class="btn btn-outline" type="button" data-pf-tab="missing">Sin coincidencia</button></div><div id="pfImportPreview" class="table-scroll" style="max-height:49vh;overflow:auto"></div><div id="pfImportProgress" role="status" style="color:#486878;font-size:12px;margin-top:8px"></div><div class="dialog-footer"><button class="btn btn-outline" id="pfImportCancel">Cancelar</button><button class="btn btn-primary" id="pfImportApply" disabled>Confirmar PVP revisados</button></div></section>`;
+ document.body.appendChild(el);
+ $id('pfImportClose').onclick=$id('pfImportCancel').onclick=()=>el.style.display='none';
+ $id('pfImportFile').onchange=previewPvp;
+ el.querySelectorAll('[data-pf-tab]').forEach(x=>x.onclick=()=>{pfActiveTab=x.dataset.pfTab;renderPvpPreview()});
+ $id('pfImportPreview').addEventListener('change',e=>{const ctl=e.target.closest('select[data-pf-choice]');if(!ctl)return;const item=pfReviewRows[Number(ctl.dataset.pfChoice)];if(!item)return;item.choice=ctl.value;refreshPvpSelection();renderPvpPreview()});
+ $id('pfImportApply').onclick=applyPvp;
+}
+let pfActiveTab='changes';
+function openPvpImport(){if(!ready())return;ensurePvpImport();pfPriceRows=[];pfReviewRows=[];pfOriginalRows=[];pfActiveTab='changes';$id('pfImportFile').value='';$id('pfImportPreview').innerHTML='';$id('pfImportSummary').textContent='Selecciona el Excel para revisar los precios.';$id('pfImportProgress').textContent='';$id('pfImportApply').disabled=true;$id('pfImportPvpDialog').style.display='block'}
+function pfMoney(n){return n==null?'Pendiente':'$'+Number(n).toFixed(2)}
+function pfSafe(v){return escapeHtml(String(v??''))}
+function pfKey(v){return pfNormalize(v)}
+function pfParsePrice(raw){if(raw==null||String(raw).trim()==='')return null;let c=String(raw).trim().replace(/[$\s]/g,'');if(c.includes(',')&&c.includes('.'))c=c.lastIndexOf(',')>c.lastIndexOf('.')?c.replace(/\./g,'').replace(',','.'):c.replace(/,/g,'');else if(c.includes(','))c=c.replace(',','.');const n=Number(c);return Number.isFinite(n)&&n>0&&n<=999999?Math.round(n*100)/100:NaN}
+function pfCandidateState(item){const id=item.status==='exact'?item.candidates[0]?.id:item.choice;return id?STORE.products.find(p=>p.id===id):null}
+function refreshPvpSelection(){
+ const targets=new Map(),block=new Set();
+ for(const r of pfReviewRows){const p=pfCandidateState(r);if(!p||r.status==='invalid'||r.status==='no-price')continue;const prev=targets.get(p.id);if(prev&&prev.price!==r.price){block.add(p.id)}else if(!prev)targets.set(p.id,{product:p,price:r.price,row:r});}
+ pfPriceRows=[...targets.values()].filter(x=>!block.has(x.product.id)&&(!Number.isFinite(Number(x.product.pvp))||x.product.pvp==null||Math.round(Number(x.product.pvp)*100)!==Math.round(x.price*100)));
+ pfReviewRows.forEach(r=>{r.conflict=false;const p=pfCandidateState(r);if(p&&block.has(p.id))r.conflict=true});
+ const exact=pfReviewRows.filter(r=>r.status==='exact').length,review=pfReviewRows.filter(r=>r.status==='suggestion'||r.status==='multi').length,approved=pfReviewRows.filter(r=>r.choice).length,missing=pfReviewRows.filter(r=>r.status==='missing').length,empty=pfReviewRows.filter(r=>r.status==='no-price').length,invalid=pfReviewRows.filter(r=>r.status==='invalid').length,conflicts=pfReviewRows.filter(r=>r.conflict).length;
+ $id('pfImportSummary').textContent=`Filas: ${pfOriginalRows.length} · Por código único o código + nombre: ${exact} · Por revisar: ${review} (${approved} aprobadas) · PVP a actualizar: ${pfPriceRows.length} · Sin correspondencia de código: ${missing} · Sin precio: ${empty} · Inválidas: ${invalid} · Conflictos: ${conflicts}. Los códigos compartidos sin nombre coincidente requieren aprobación manual.`;
+ $id('pfImportApply').disabled=!pfPriceRows.length;
+}
+async function previewPvp(){
+ const msg=$id('pfImportSummary');$id('pfImportApply').disabled=true;pfPriceRows=[];pfReviewRows=[];
+ try{
+  const file=$id('pfImportFile').files[0];if(!file)return;
+  const XLSX=await pfEnsureXlsx();
+  const wb=XLSX.read(await file.arrayBuffer(),{type:'array'});pfOriginalRows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:'',raw:false});
+  if(!pfOriginalRows.length)throw Error('El Excel está vacío.');
+  const byCode=new Map();for(const p of STORE.products){const c=pfKey(p.code);if(!c)continue;if(!byCode.has(c))byCode.set(c,[]);byCode.get(c).push(p)}
+  pfReviewRows=pfOriginalRows.map((row,index)=>{
+   const kv=Object.fromEntries(Object.entries(row).map(([k,v])=>[pfKey(k),v]));
+   const code=String(kv['CODIGO DE BARRAS']??kv['CODIGO']??'').trim().replace(/\.0$/,'');
+   const name=String(kv['ITEM PRODUCTO']??kv['PRODUCTO']??kv['NOMBRE']??'').trim();
+   const raw=kv['PRECIO UNITARIO']??kv['PVP']??'';const price=pfParsePrice(raw);
+   const r={index,code,name,price,candidates:[],status:'',choice:'',conflict:false};
+   if(!code||!name||Number.isNaN(price)){r.status='invalid';return r}
+   if(price==null){r.status='no-price';return r}
+   const list=byCode.get(pfKey(code))||[];
+   if(!list.length){r.status='missing';return r}
+   const exact=list.filter(p=>pfKey(p.name)===pfKey(name));
+   // Un código que corresponde a un solo SKU identifica el producto aun si el nombre difiere.
+   // Para códigos compartidos, exigir además coincidencia única de nombre o revisión manual.
+   if(list.length===1){r.candidates=list;r.status='exact'}
+   else if(exact.length===1){r.candidates=exact;r.status='exact'}
+   else{r.candidates=list;r.status='multi'}
+   return r;
+  });
+  pfActiveTab='changes';refreshPvpSelection();renderPvpPreview();
+ }catch(e){msg.textContent='No se pudo revisar el archivo: '+(e.message||e)}
+}
+function renderPvpPreview(){
+ const holder=$id('pfImportPreview');if(!holder)return;
+ $id('pfImportTabs').querySelectorAll('[data-pf-tab]').forEach(b=>{b.style.background=b.dataset.pfTab===pfActiveTab?'#dcf5ff':''});
+ if(pfActiveTab==='changes'){
+ const data=pfPriceRows.slice(0,120);holder.innerHTML=`<table class="data-table"><thead><tr><th>Código</th><th>Producto en inventario</th><th>PVP actual</th><th>PVP nuevo</th></tr></thead><tbody>${data.map(x=>`<tr><td>${pfSafe(x.product.code)}</td><td>${pfSafe(x.product.name)}</td><td>${pfMoney(x.product.pvp)}</td><td><b>${pfMoney(x.price)}</b></td></tr>`).join('')}</tbody></table>${pfPriceRows.length>120?'<p>Mostrando los primeros 120 cambios.</p>':''}${!data.length?'<p style="padding:12px">No hay precios listos para actualizar.</p>':''}`;
+ }else if(pfActiveTab==='review'){
+ const rows=pfReviewRows.filter(r=>r.status==='suggestion'||r.status==='multi'||r.conflict);holder.innerHTML=`<p style="margin:8px 0;color:#607a8b">Los códigos compartidos necesitan coincidencia de nombre o revisión manual. Si no estás seguro, déjalos pendientes.</p><table class="data-table"><thead><tr><th>Excel: código / nombre</th><th>PVP</th><th>Coincidencia en inventario</th><th>Estado</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${pfSafe(r.code)}<br><b>${pfSafe(r.name)}</b></td><td>${pfMoney(r.price)}</td><td><select data-pf-choice="${r.index}" style="max-width:330px;padding:8px;border-radius:7px;border:1px solid #c1d5dd"><option value="">Pendiente · no actualizar</option>${r.candidates.map(p=>`<option value="${pfSafe(p.id)}" ${r.choice===p.id?'selected':''}>${pfSafe(p.name)} (${pfSafe(p.code)})</option>`).join('')}</select></td><td>${r.conflict?'Conflicto de precios':r.choice?'Aprobado':r.status==='multi'?'Código compartido':'Nombre diferente'}</td></tr>`).join('')}</tbody></table>${!rows.length?'<p>No hay coincidencias pendientes de revisión.</p>':''}`;
+ }else{
+ const rows=pfReviewRows.filter(r=>r.status==='missing'||r.status==='invalid'||r.status==='no-price');holder.innerHTML=`<table class="data-table"><thead><tr><th>Código</th><th>Nombre en Excel</th><th>Motivo</th></tr></thead><tbody>${rows.slice(0,200).map(r=>`<tr><td>${pfSafe(r.code)}</td><td>${pfSafe(r.name)}</td><td>${r.status==='missing'?'Código no existe en inventario':r.status==='no-price'?'Sin PVP':'Fila inválida'}</td></tr>`).join('')}</tbody></table>${rows.length>200?'<p>Mostrando primeros 200 pendientes.</p>':''}`;
+ }
+}
+async function applyPvp(){
+ if(!ready()||!pfPriceRows.length)return;
+ const count=pfPriceRows.length;
+ if(!confirm('¿Actualizar SOLAMENTE los PVP de '+count+' productos aprobados? Stock, ubicaciones, caducidades y conteos no cambiarán.'))return;
+ const btn=$id('pfImportApply'),msg=$id('pfImportProgress');btn.disabled=true;
+ let applied=0;
+ try{
+  for(let i=0;i<pfPriceRows.length;i+=150){
+   const batch=fb.fsm.writeBatch(fb.db),chunk=pfPriceRows.slice(i,i+150);
+   for(const {product,price} of chunk){
+    batch.update(fb.fsm.doc(fb.db,'stock',product.id),{pvp:price,pvpUpdatedAt:new Date().toISOString()});
+    batch.set(fb.fsm.doc(fb.db,'service_products',product.id),serviceProjection({...product,pvp:price}));
+   }
+   await batch.commit();applied+=chunk.length;
+   chunk.forEach(({product,price})=>product.pvp=price);
+   msg.textContent=`PVP sincronizados: ${applied} de ${count}.`;
+  }
+  pfPriceRows=[];refreshPvpSelection();renderPvpPreview();
+  msg.textContent=`Finalizado: ${applied} precios actualizados. Stock, ubicaciones, conteos y reconteos intactos.`;
+ }catch(e){msg.textContent=`Se actualizaron ${applied} precios. Error: ${e.message||e}. Vuelve a cargar el Excel antes de reintentar.`}
+}
+// Primera publicación del inventario ya existente, sin Cloud Functions.
+async function publishInitial(){
+ if(!ready())return;const msg=$id('pfSyncStatus')||$id('pfpvpMsg');
+ const products=STORE.products.filter(p=>p.id&&p.code&&p.name);
+ if(!confirm('Publicar '+products.length+' productos existentes para Atención al Cliente? No cambia conteos ni ubicaciones.'))return;
+ try{
+  const trigger=$id('pfSyncPublish');if(trigger)trigger.disabled=true;
+  for(let i=0;i<products.length;i+=175){
+   const b=fb.fsm.writeBatch(fb.db);
+   for(const p of products.slice(i,i+175))b.set(fb.fsm.doc(fb.db,'service_products',p.id),serviceProjection(p));
+   await b.commit();msg.textContent='Publicados '+Math.min(i+175,products.length)+' de '+products.length+' productos…';
+  }
+  msg.textContent='Catálogo publicado. Los cambios posteriores de inventario y PVP se publicarán automáticamente.';
+ }catch(e){msg.textContent='Publicación incompleta: '+(e.message||e)}finally{const trigger=$id('pfSyncPublish');if(trigger)trigger.disabled=false}
+}
+
+// Venta fraccionada: habilitación explícita, nunca inferida automáticamente del nombre.
+function pfFractionDialog(){
+ let modal=$id('pfFractionDialog');if(modal)return modal;
+ modal=document.createElement('div');modal.id='pfFractionDialog';modal.style.cssText='display:none;position:fixed;inset:0;z-index:116;background:#182d42aa;padding:18px;overflow:auto';
+ modal.innerHTML=`<section style="max-width:820px;margin:3vh auto;background:white;border-radius:18px;padding:22px;color:#15334a"><header style="display:flex;justify-content:space-between;gap:12px;align-items:center"><h2>Venta por unidad · Supervisión</h2><button type="button" id="pfFractionClose" class="btn btn-outline">Cerrar</button></header><input id="pfFractionSearch" class="input" placeholder="Buscar código o nombre" style="margin:14px 0;width:100%"><div id="pfFractionList" style="max-height:54vh;overflow:auto"></div><div id="pfFractionEdit" style="display:none;border-top:1px solid #d8e8f0;padding-top:14px;margin-top:10px"></div><p id="pfFractionMessage" role="status" style="font-size:12px;color:#3e6b82;margin-top:10px"></p></section>`;
+ document.body.appendChild(modal);
+ $id('pfFractionClose').onclick=()=>modal.style.display='none';
+ $id('pfFractionSearch').oninput=pfFractionSearch;
+ modal.addEventListener('click',e=>{const b=e.target.closest('[data-fraction-id]');if(b)pfFractionSelect(b.dataset.fractionId)});
+ return modal;
+}
+function pfFractionOpen(){if(!ready())return;pfFractionDialog().style.display='block';$id('pfFractionSearch').value='';$id('pfFractionEdit').style.display='none';pfFractionSearch()}
+function pfFractionSearch(){const q=($id('pfFractionSearch').value||'').toLocaleUpperCase().trim();const rows=STORE.products.filter(p=>!q||String(p.code||'').toUpperCase().includes(q)||String(p.name||'').toUpperCase().includes(q)).slice(0,45);$id('pfFractionList').innerHTML=rows.map(p=>`<button type="button" data-fraction-id="${escapeHtml(p.id)}" style="width:100%;padding:10px;border:0;border-bottom:1px solid #e1edf2;background:#fff;text-align:left;cursor:pointer"><b>${escapeHtml(p.name||'')}</b><small style="display:block;color:#67869a">${escapeHtml(p.code||'')} · ${p.fractionAllowed?'Fraccionado':'Venta completa'}</small></button>`).join('')||'<p>Sin productos.</p>'}
+function pfFractionSelect(id){const p=STORE.products.find(x=>x.id===id);if(!p)return;const box=$id('pfFractionEdit');box.style.display='block';const price=p.pvp==null?'PVP pendiente':'$'+Number(p.pvp).toFixed(2);const units=Number(p.fractionUnits||0);const override=p.fractionOverride===true;box.innerHTML=`<b>${escapeHtml(p.name||'')}</b><p style="margin:6px 0 10px;color:#55798c">PVP presentación: ${price}. Sin cambios en stock ni ubicaciones.</p><label style="display:block;margin-bottom:9px"><input type="checkbox" id="pfFractionAllowed" ${p.fractionAllowed?'checked':''}> Permitir venta fraccionada (confirmada por Supervisión)</label><label style="display:block;margin-bottom:9px">Unidades por presentación <input id="pfFractionUnits" type="number" min="1" max="10000" step="1" value="${units||''}" class="input" style="max-width:180px"></label><label style="display:block;margin-bottom:9px"><input type="checkbox" id="pfFractionOverride" ${override?'checked':''}> Establecer precio por unidad manualmente</label><label style="display:block;margin-bottom:9px">PVP unitario manual ($) <input id="pfFractionPrice" type="number" min="0.01" max="999999" step="0.01" value="${override&&p.fractionPvp!=null?Number(p.fractionPvp).toFixed(2):''}" class="input" style="max-width:180px"></label><p id="pfFractionPreview" style="color:#126288;font-weight:700;margin:8px 0"></p><button id="pfFractionSave" type="button" class="btn btn-primary">Guardar venta por unidad</button>`;
+ const update=()=>{const allow=$id('pfFractionAllowed').checked,n=Number($id('pfFractionUnits').value),manual=$id('pfFractionOverride').checked,full=Number(p.pvp);$id('pfFractionPrice').disabled=!manual;const auto=Number.isInteger(n)&&n>0&&Number.isFinite(full)&&full>0?Math.round((full/n)*100)/100:null;$id('pfFractionPreview').textContent=!allow?'Venta fraccionada deshabilitada':manual?'Precio unitario manual: $'+(Number($id('pfFractionPrice').value)||0).toFixed(2):auto!==null?'Precio unitario calculado: $'+auto.toFixed(2):'Para calcular, registra PVP presentación y unidades válidas.'};
+ box.querySelectorAll('input').forEach(el=>el.addEventListener('input',update));box.querySelectorAll('input[type=checkbox]').forEach(el=>el.addEventListener('change',update));update();
+ $id('pfFractionSave').onclick=async()=>{const allow=$id('pfFractionAllowed').checked,n=Number($id('pfFractionUnits').value),manual=$id('pfFractionOverride').checked,unit=Number($id('pfFractionPrice').value);if(allow&&(!Number.isSafeInteger(n)||n<1||n>10000)){$id('pfFractionMessage').textContent='Indica cuántas unidades tiene la presentación.';return}if(allow&&manual&&(!Number.isFinite(unit)||unit<=0||unit>999999)){$id('pfFractionMessage').textContent='Indica un PVP unitario válido.';return}if(allow&&!manual&&!(Number(p.pvp)>0)){$id('pfFractionMessage').textContent='Primero registra el PVP de la presentación.';return}const data={fractionAllowed:allow,fractionUnits:allow?n:0,fractionOverride:allow&&manual,fractionPvp:allow&&manual?Math.round(unit*100)/100:null};const btn=$id('pfFractionSave');btn.disabled=true;$id('pfFractionMessage').textContent='Guardando…';try{const b=fb.fsm.writeBatch(fb.db);b.update(fb.fsm.doc(fb.db,'stock',id),data);b.set(fb.fsm.doc(fb.db,'service_products',id),{...data,updatedAt:new Date().toISOString()},{merge:true});await b.commit();Object.assign(p,data);$id('pfFractionMessage').textContent='Precio fraccionado guardado y sincronizado.';pfFractionSearch();}catch(e){$id('pfFractionMessage').textContent='Error al guardar: '+String(e.message||e)}finally{btn.disabled=false}};
+}
+
+ensure();
+document.addEventListener('click',e=>{
+ if(e.target.closest('[data-fraction-open]')){pfFractionOpen();return;}
+ const open=e.target.closest('[data-pf-open]');
+ if(open){show();return;}
+ const pvpImport=e.target.closest('[data-pf-import-pvp]');
+ if(pvpImport){openPvpImport();return;}
+ const publish=e.target.closest('[data-pf-publish]');
+ if(publish){publishInitial();return;}
+});
+})();
 })();
 
-  </script>
+</script>
 </body>
 </html>
