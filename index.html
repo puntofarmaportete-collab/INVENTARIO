@@ -1489,7 +1489,7 @@ function pfDailyOpen(){
  <option value="final">Stock final y/o PVP (establecer existencias actuales)</option>
  <option value="ventas">Ventas del período y/o PVP (descontar unidades vendidas)</option>
  </select></div>
- <div class="import-zone">${I('file')}<b>Actualizar varios productos por Excel</b><span class="small muted">Acepta Código y/o Producto, además de Stock nuevo, Unidades vendidas o PVP nuevo. Se comprueban coincidencias antes de guardar.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div>
+ <div class="import-zone">${I('file')}<b>Actualizar varios productos por Excel</b><span class="small muted">Acepta Código y/o Producto, Stock nuevo o Stock Actual, PVP nuevo o P. Final (PVP). Revisa las coincidencias antes de guardar.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div>
  <div class="invoice-note">No cargues una factura de compra aquí: las compras se <b>suman</b> por el flujo «Agregar stock por factura». El stock final <b>reemplaza</b> solo los códigos incluidos; las ventas <b>restan</b> unidades.</div>
  <div class="dialog-footer" style="flex-wrap:wrap"><button type="button" class="btn btn-outline" data-action="pf-daily-template">${I('download')} Plantilla Excel</button><button type="button" class="btn btn-outline" data-action="update-theory">Agregar stock por factura</button><button type="submit" class="btn btn-primary">Revisar cambios</button></div>
  </form></div>`);
@@ -1675,8 +1675,10 @@ async function pfDailyRead(file,mode){
    const record=pfDailyKeyMap(raw[i]);
    const code=pfDailyCode(pfDailyField(record,['Código','Codigo de barras','Codigo barras','SKU','Code','Cod','Cod Barras','Codigo del producto']));
    const name=pfDailyField(record,['Producto','Nombre','Descripción','Descripcion','Item','Item / Producto','Descripcion del producto','Nombre producto']);
-   const qtyText=mode==='ventas'?pfDailyField(record,['Unidades vendidas','Cantidad vendida','Vendidas','Cantidad ventas','Cantidad']):pfDailyField(record,['Stock nuevo','Nuevo stock','Stock final','Stock actualizado','Existencia nueva','Existencias nuevas','Cantidad nueva','Qty stock','Stock','Existencia','Existencias','Cantidad','Qty']);
-   const priceText=pfDailyField(record,['PVP nuevo','Nuevo PVP','Precio nuevo','Precio de venta nuevo','PVP','Precio venta','Precio actualizado','Precio de venta','Precio publico']);
+   // Ignorar totales y resúmenes del reporte; no son artículos del inventario.
+   if(['total','totales','subtotal','subtotales','resumen'].includes(pfDailyName(code)))continue;
+   const qtyText=mode==='ventas'?pfDailyField(record,['Unidades vendidas','Cantidad vendida','Vendidas','Cantidad ventas','Cantidad']):pfDailyField(record,['Stock nuevo','Nuevo stock','Stock final','Stock actualizado','Stock Actual','Existencia nueva','Existencias nuevas','Existencia actual','Cantidad actual','Cantidad nueva','Qty stock','Stock','Existencia','Existencias','Cantidad','Qty']);
+   const priceText=pfDailyField(record,['PVP nuevo','Nuevo PVP','Precio nuevo','Precio de venta nuevo','P. Final (PVP)','P Final PVP','Precio final (PVP)','Precio final','PVP','Precio venta','Precio actualizado','Precio de venta','Precio publico']);
    if(qtyText===''&&priceText==='')continue;
    if(!code&&!name){issues.push(`Fila ${i+2}: falta código o nombre`);continue}
    const qty=pfDailyNumber(qtyText),pvp=pfDailyNumber(priceText,true);
