@@ -327,6 +327,14 @@ const demoAdapter={
  async deleteCount(id){STORE.counts=STORE.counts.filter(x=>x.id!==id);syncLocal()},
  async upsertProducts(ps){let m=new Map(STORE.products.map(p=>[p.id,p]));for(let p of ps)m.set(p.id,cleanSku(p));STORE.products=[...m.values()];syncLocal()},
  async applyTheoryUpdate(ps,onProgress){await demoAdapter.upsertProducts(ps);onProgress?.(ps.length,ps.length)},
+ async applyInvoiceAdditions(review,onProgress){
+   const planned=invoicePlannedProducts();
+   const prior=new Map(STORE.products.map(p=>[p.id,p]));
+   if(!STORE.invoiceKeys)STORE.invoiceKeys=new Set();
+   let added=0,skipped=0;
+   for(const p of planned){const key=review.importKey+':'+p.id;if(STORE.invoiceKeys.has(key)){skipped++;continue;}STORE.invoiceKeys.add(key);prior.set(p.id,cleanSku(p));added++;}
+   STORE.products=[...prior.values()];onProgress?.(planned.length,planned.length);syncLocal();return {added,skipped};
+ },
  async updateProduct(id,updates){let p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto no encontrado.');Object.assign(p,updates);syncLocal()},
  async deleteProduct(id){if(STORE.counts.some(c=>c.skuId===id))throw Error('Este producto tiene conteos. Primero revisa sus registros.');STORE.products=STORE.products.filter(p=>p.id!==id);STORE.recounts=STORE.recounts.filter(t=>t.skuId!==id);syncLocal()},
  async removeRecount(skuId){if(STORE.role!=='supervisor')throw Error('Solo Supervisión puede retirar reconteos.');STORE.recounts=STORE.recounts.filter(t=>t.skuId!==skuId);syncLocal()},
@@ -431,7 +439,7 @@ const firebaseAdapter={
  async linkSurplus(items){const {fsm,db}=fb;for(let i=0;i<items.length;i+=150){const b=fsm.writeBatch(db);for(const a of items.slice(i,i+150)){b.update(fsm.doc(db,'surplus',a.id),{linkedSkuId:a.skuId,linkedAt:now(),linkedBy:STORE.uid})}await b.commit()}},
  async editCount(id,data){await fb.fsm.updateDoc(fb.fsm.doc(fb.db,'counts',id),{...data,updatedAt:now()})},
  async deleteCount(id){const b=fb.fsm.writeBatch(fb.db);b.delete(fb.fsm.doc(fb.db,'counts',id));b.delete(fb.fsm.doc(fb.db,'markers',id));await b.commit();if(STORE.role==='operator'&&refreshMarkerProgress)await refreshMarkerProgress().catch(e=>console.warn('Avance pendiente de actualizar',e))},
- async upsertProducts(ps){const {db,fsm}=fb;if(!ps.length)return;for(let i=0;i<ps.length;i+=200){let b=fsm.writeBatch(db);for(let p of ps.slice(i,i+200)){b.set(fsm.doc(db,'catalog',p.id),publicProduct(p));const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);b.set(fsm.doc(db,'stock',id),{...stock});b.set(fsm.doc(db,'service_products',p.id),serviceProjection(p));}if(i+200>=ps.length)b.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:ps.length<=12?'upsert':'full',ids:ps.length<=12?ps.map(p=>p.id):[]});await b.commit()}},
+ async upsertProducts(ps){const {db,fsm}=fb;if(!ps.length)return;for(let i=0;i<ps.length;i+=125){let b=fsm.writeBatch(db);for(let p of ps.slice(i,i+125)){b.set(fsm.doc(db,'catalog',p.id),publicProduct(p));const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);b.set(fsm.doc(db,'stock',id),{...stock},{merge:true});b.set(fsm.doc(db,'service_products',p.id),serviceProjection(p));}if(i+125>=ps.length)b.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:ps.length<=12?'upsert':'full',ids:ps.length<=12?ps.map(p=>p.id):[]});await b.commit()}},
  async applyTheoryUpdate(ps,onProgress){
    const {db,fsm}=fb;
    if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected)throw Error('Se requiere supervisión con Firebase conectado.');
@@ -450,12 +458,80 @@ const firebaseAdapter={
      for(const p of ps.slice(i,i+125)){
        batch.set(fsm.doc(db,'catalog',p.id),publicProduct(p));
        const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(p);
-       batch.set(fsm.doc(db,'stock',id),stock);
+       batch.set(fsm.doc(db,'stock',id),stock,{merge:true});
        batch.set(fsm.doc(db,'service_products',p.id),serviceProjection(p));
      }
      if(i+125>=ps.length)batch.set(fsm.doc(db,'catalog',SYNC_DOC),{version:strId(),updatedAt:now(),kind:'catalog',action:'full',ids:[]});
      await batch.commit();finished+=Math.min(125,ps.length-i);onProgress?.(finished,ps.length);
    }
+ },
+ async applyInvoiceAdditions(review,onProgress){
+   const {db,fsm}=fb;
+   if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected)throw Error('Se requiere Supervisión con Firebase conectado.');
+   if(!review?.importKey||!review.items?.length)throw Error('Primero valida la factura.');
+   const changes=invoicePlannedProducts(),byId=new Map(STORE.products.map(p=>[p.id,p]));
+   let done=0,added=0,skipped=0,successfulIds=[];
+   const signal=async()=>{
+     if(!successfulIds.length)return;
+     // La señal se emite una vez al terminar (o tras una interrupción), para que
+     // empleados no descarguen todo el catálogo por cada renglón del archivo.
+     for(let i=0;i<successfulIds.length;i+=12){
+       const ids=successfulIds.slice(i,i+12);
+       await fsm.setDoc(fsm.doc(db,'catalog',SYNC_DOC),{
+         version:strId(),updatedAt:now(),kind:'catalog',action:'upsert',ids
+       });
+     }
+   };
+   try{
+     for(const planned of changes){
+       const old=byId.get(planned.id),qty=invoiceProposedQty(review.items.find(x=>(x.targetId==='NEW'?x.newId:x.targetId)===planned.id));
+       if(!Number.isSafeInteger(qty)||qty<=0)throw Error('Unidades a sumar inválidas en '+planned.code+'.');
+       const ref=fsm.doc(db,'stock',planned.id),cat=fsm.doc(db,'catalog',planned.id),serviceRef=fsm.doc(db,'service_products',planned.id);
+       const state=await fsm.runTransaction(db,async tx=>{
+         // El recibo se marca en EL MISMO documento donde se incrementa el stock.
+         // Si se repite este Excel, la transacción no vuelve a sumar.
+         const st=await tx.get(ref);
+         const current=st.exists()?st.data():null;
+         const applied=Array.isArray(current?.appliedStockImports)?current.appliedStockImports:[];
+         if(applied.includes(review.importKey)){
+           // El archivo se procesó anteriormente. Reparar únicamente el espejo
+           // de consulta si no estaba publicado, SIN volver a sumar stock.
+           const priorMirror=await tx.get(serviceRef);
+           const prevQty=Number(current?.theoretical||0);
+           if(!priorMirror.exists()||Number(priorMirror.data().qty)!==prevQty){
+             const previous=priorMirror.exists()?priorMirror.data():{};
+             tx.set(serviceRef,{...serviceProjection({...old,...current,theoretical:prevQty}),
+               // Mantener cualquier PVP previamente publicado si stock aún no lo conoce.
+               pvp:current?.pvp!=null?Number(current.pvp):previous.pvp??old?.pvp??null});
+           }
+           return 'duplicado';
+         }
+         if(old){
+           if(!st.exists())throw Error('Falta stock para '+old.code+'. Vuelve a sincronizar.');
+           const prev=Number(current.theoretical);
+           if(!Number.isSafeInteger(prev)||prev<0||prev+qty>10000000)throw Error('Stock fuera de rango en '+old.code);
+           tx.update(ref,{theoretical:prev+qty,appliedStockImports:[...applied,review.importKey],lastStockAdditionQty:qty,lastStockAdditionAt:now()});
+           // Stock y producto visible en Atención al Cliente se publican atómicamente.
+           tx.set(serviceRef,serviceProjection({...old,...current,theoretical:prev+qty}));
+         }else{
+           // Evita reemplazar una referencia creada desde otra sesión.
+           const catSnap=await tx.get(cat);
+           if(catSnap.exists()||st.exists())throw Error('El código '+planned.code+' ya existe; recarga el inventario y vuelve a comparar antes de agregar.');
+           const {id,code,name,category,presentation,unitsPerPresentation,...stock}=cleanSku(planned);
+           tx.set(cat,publicProduct(planned));
+           tx.set(ref,{...stock,appliedStockImports:[review.importKey],lastStockAdditionQty:qty,lastStockAdditionAt:now()});
+           tx.set(serviceRef,serviceProjection(planned));
+         }
+         return 'agregado';
+       });
+       if(state==='duplicado')skipped++;else{added++;successfulIds.push(planned.id)}
+       done++;onProgress?.(done,changes.length);
+     }
+   }finally{
+     // Aunque falle una fila, comunica los cambios que sí se confirmaron.
+     if(successfulIds.length){try{await signal()}catch(e){console.warn('Pendiente comunicar cambios de catálogo:',e)}}
+   }
+   return {added,skipped};
  },
  async updateProduct(id,updates){const p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto inexistente.');await firebaseAdapter.upsertProducts([{...p,...updates}])},
  async deleteProduct(id){
@@ -1212,7 +1288,24 @@ function recountMarkup(){
  const queue=`<section class="surface pad" id="recount-queue"><div class="surface-head"><h3 class="surface-title">Códigos disponibles</h3><span class="pill green">${pending.length} pendientes</span></div><p class="small muted" style="margin-bottom:12px">Al seleccionar un código, se reservará para ti y desaparecerá de las listas de otros colaboradores.</p><div class="recount-items">${pending.map(t=>`<div class="recount-item"><div><strong>${escapeHtml(t.name)}</strong><small>${escapeHtml(t.code)} · ${(t.positions||[]).length} posición(es)</small></div><button class="btn btn-primary btn-sm" data-action="claim-recount" data-id="${escapeHtml(t.skuId)}">Tomar</button></div>`).join('')||'<div class="empty">No hay códigos disponibles para reconteo.</div>'}</div></section>`;
  return `<div class="worker-shell recount-shell"><header class="worker-header">${logo()}<div class="chiprow">${badgeConnection()}<button class="btn btn-outline btn-icon" data-action="logout" title="Salir">${I('exit')}</button></div></header><div class="worker-welcome" id="recount-metrics"><span style="font-size:11px;letter-spacing:1px;font-weight:800">RECONTEO DE NOVEDADES</span><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h2 style="margin:0">¡Hola, ${escapeHtml(STORE.user.displayName)}!</h2><button type="button" class="btn btn-outline btn-sm" style="color:#fff;border-color:rgba(255,255,255,.55);background:rgba(255,255,255,.12);flex-shrink:0" data-action="sync-progress" title="Comprobar avance general">${I('refresh')} Actualizar</button></div><div class="worker-metrics"><div><small>Disponibles</small><strong>${pending.length}</strong></div><div><small>En revisión</small><strong>${tasks.filter(t=>t.status==='in_progress').length}</strong></div><div><small>Finalizados</small><strong>${done.length}</strong></div></div></div><div class="recount-cols"><section class="surface pad recount-work"><div class="surface-head"><h3 class="surface-title">${active?'Código reservado':'Mi reconteo'}</h3>${active?'<span class="pill yellow">Asignado a ti</span>':''}</div>${active?`<div class="selected-prod recount-selected-product" style="margin-bottom:15px"><div><strong>${escapeHtml(active.name)}</strong><small>${escapeHtml(active.code)}</small></div><a class="btn btn-outline btn-sm recount-image-link" href="${escapeHtml('https://www.google.com/search?tbm=isch&q='+encodeURIComponent(active.name+' '+active.code))}" target="_blank" rel="noopener noreferrer" title="Buscar imágenes del producto en Google">${I('search')} Ver imagen</a></div><h4 style="margin-bottom:9px">Posiciones registradas anteriormente</h4><div class="chiprow" style="margin-bottom:13px">${(active.positions||[]).map(x=>`<span class="position-chip">${escapeHtml(x)}</span>`).join('')||'<span class="small muted">Sin posiciones previas: revisa las cajas y registra dónde encontraste el producto. Si no aparece, utiliza «No encontré unidades».</span>'}</div><form id="recount-form" data-form="recount-count" class="form-stack"><div class="form-row"><div class="field"><label>Unidades físicas *</label><input class="input" type="number" name="qty" min="1" step="1" inputmode="numeric" required></div><div class="field"><label>Posición *</label><input class="input" name="position" inputmode="numeric" pattern="[0-9]+" placeholder="01" required></div></div><div class="field"><label>Caducidad * (MMAA)</label><input class="input" name="expiry" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" placeholder="0826" required><small>Ejemplo: 0826 = Agosto/2026</small></div><button type="submit" class="btn btn-primary btn-block">${I('check')} Guardar registro</button></form><div class="recount-saved"><h4>Mis registros del reconteo (${ownEntries.length})</h4>${ownEntries.map(e=>`<div class="recount-entry"><span>${e.qty===0?'No encontrado':`Pos. ${escapeHtml(e.position)} · ${formatDate(e.expiry)}`}</span><span><strong>${nfmt(e.qty)} und.</strong> <button class="btn btn-danger btn-icon btn-sm" data-action="delete-recount-entry" data-id="${escapeHtml(e.id)}" title="Eliminar registro">${I('trash')}</button></span></div>`).join('')||'<div class="small muted">Aún no hay registros guardados.</div>'}</div><div class="recount-buttons"><button class="btn btn-lime" data-action="finish-recount" data-id="${escapeHtml(active.skuId)}" ${ownEntries.length?'':'disabled'}>${I('check')} Finalizar reconteo</button><button class="btn btn-outline" data-action="release-recount" data-id="${escapeHtml(active.skuId)}">Liberar código</button>${ownEntries.length?'':`<button class="btn btn-outline" data-action="recount-no-stock" data-id="${escapeHtml(active.skuId)}">No encontré unidades</button>`}</div>`:'<div class="empty">Selecciona un código de la lista para comenzar. No verás cantidades del primer conteo ni stock teórico.</div>'}</section>${queue}</div></div>`;
 }
-function inventoryMarkup(){return `${header('Mi inventario','',`<button class="btn btn-primary" data-action="import-modal">${I('upload')} Carga inicial</button><button class="btn btn-lime" data-action="update-theory">${I('refresh')} Actualizar stock teórico</button><button class="btn btn-outline" data-action="reconcile-existing-surplus">${I('check')} Conciliar fuera de stock</button><button class="btn btn-outline" data-action="new-product">${I('plus')} Nuevo producto</button>`)}<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Referencias',nfmt(STORE.products.length),'inventory')}${kpi('Unidades teóricas',nfmt(STORE.products.reduce((a,p)=>a+(Number(p.theoretical)||0),0)),'database')}${kpi('Costo declarado',money(STORE.products.reduce((a,p)=>a+(Number(p.costTotal)||0),0)),'dashboard')}</div><section class="surface pad" style="margin-bottom:17px;border-left:4px solid #08aee8"><div class="surface-head"><div><h3 class="surface-title">Sincronización con Atención al Cliente</h3></div><span class="pill green">Sin Cloud Functions</span></div><div class="toolbar" style="margin-top:12px"><button type="button" id="pfSyncPublish" class="btn btn-primary" data-pf-publish>Publicar inventario existente</button><button type="button" class="btn btn-outline" data-pf-open>Administrar PVP</button><button type="button" class="btn btn-outline" data-fraction-open>Venta por unidad</button><button type="button" class="btn btn-lime" data-pf-import-pvp>Importar PVP desde Excel</button></div><p id="pfSyncStatus" class="small muted" role="status" aria-live="polite" style="margin-top:12px">Inventario disponible: ${nfmt(STORE.products.length)} referencias. Estado de publicación: no verificado en esta sesión.</p></section><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Catálogo de productos</h3></div><button class="btn btn-outline btn-sm" data-action="export-inventory">${I('download')} Excel</button></div><div class="search-wrap" style="margin-bottom:13px">${I('search')}<input class="input" id="inventory-search" value="${escapeHtml(STATE.invQuery)}" placeholder="Buscar en todo el inventario…"></div><div id="inventory-table">${inventoryTable()}</div></section>${reviewPresentationMarkup()}`}
+function inventoryMarkup(){return `${header('Mi inventario','',`<button class="btn btn-primary" data-action="stock-price-open">${I('refresh')} Actualizar inventario</button>`)}
+<div class="kpi-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">${kpi('Referencias',nfmt(STORE.products.length),'inventory')}${kpi('Unidades teóricas',nfmt(STORE.products.reduce((a,p)=>a+(Number(p.theoretical)||0),0)),'database')}${kpi('Costo declarado',money(STORE.products.reduce((a,p)=>a+(Number(p.costTotal)||0),0)),'dashboard')}</div>
+<section class="surface pad" style="margin-bottom:17px"><div class="surface-head"><div><h3 class="surface-title">Stock y precios</h3></div><span class="pill green">Sincronización con Atención al Cliente</span></div>
+<p class="muted small" style="margin:8px 0 13px">Actualiza cantidades y PVP desde un Excel, o agrega existencias por factura. Solo se modifican los productos que confirmes.</p>
+<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:650;color:#356b83;padding:8px 0">Más herramientas</summary>
+<div class="toolbar" style="margin-top:12px">
+<button class="btn btn-outline btn-sm" data-action="new-product">${I('plus')} Nuevo producto</button>
+<button class="btn btn-outline btn-sm" data-pf-open>Editar PVP individual</button>
+<button class="btn btn-outline btn-sm" data-fraction-open>Venta por unidad</button>
+<button class="btn btn-outline btn-sm" data-pf-import-pvp>Importar PVP (formato anterior)</button>
+<button class="btn btn-outline btn-sm" data-action="reconcile-existing-surplus">Conciliar fuera de stock</button>
+<button class="btn btn-outline btn-sm" id="pfSyncPublish" data-pf-publish>Publicar inventario existente</button>
+</div>
+<details style="margin:10px 0 0"><summary style="cursor:pointer;color:#a05542">Administración inicial (usar solo si se conoce el alcance)</summary><button class="btn btn-outline btn-sm" style="margin-top:10px" data-action="import-modal">Carga inicial</button></details>
+<p id="pfSyncStatus" class="small muted" role="status" aria-live="polite" style="margin-top:12px">Estado de publicación: no verificado en esta sesión.</p>
+</details></section>
+<section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Catálogo de productos</h3></div><button class="btn btn-outline btn-sm" data-action="export-inventory">${I('download')} Excel</button></div><div class="search-wrap" style="margin-bottom:13px">${I('search')}<input class="input" id="inventory-search" value="${escapeHtml(STATE.invQuery)}" placeholder="Buscar en todo el inventario…"></div><div id="inventory-table">${inventoryTable()}</div></section>${reviewPresentationMarkup()}`}
+
 function inventoryTable(){let rows=STORE.products.filter(p=>matches(p,STATE.invQuery));const lim=15,max=Math.max(1,Math.ceil(rows.length/lim));STATE.invPage=Math.max(0,Math.min(STATE.invPage,max-1));return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Categoría</th><th>Presentación</th><th class="right">Teórico</th><th class="right">Costo total</th><th class="right">Acciones</th></tr></thead><tbody>${rows.slice(STATE.invPage*lim,(STATE.invPage+1)*lim).map(p=>`<tr><td><div class="product-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div><span class="product-code">${escapeHtml(p.code)}</span></td><td>${escapeHtml(p.category||'Sin categoría')}</td><td>${escapeHtml(p.presentation||'—')}</td><td class="right bold">${nfmt(p.theoretical)}</td><td class="right">${money(p.costTotal)}</td><td><div class="actions-cell"><button class="btn btn-outline btn-icon" title="Editar" data-action="edit-product" data-id="${p.id}">${I('edit')}</button><button class="btn btn-danger btn-icon" title="Eliminar" data-action="delete-product" data-id="${p.id}">${I('trash')}</button></div></td></tr>`).join('')||`<tr><td colspan="6" class="empty">No hay coincidencias.</td></tr>`}</tbody></table></div>${pagination(rows.length,lim,STATE.invPage,'inv')}`}
 function expiryMarkup(){let c=[...STORE.counts.map(x=>({...x,product:STORE.products.find(p=>p.id===x.skuId)})),...STORE.surplus.map(x=>({...x,isSurplus:true,position:'—',product:{name:x.productName,code:x.code}}))].filter(x=>x.expiry&&validDate(x.expiry));const expir=c.filter(x=>daysTo(x.expiry)<0),d30=c.filter(x=>daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30),d60=c.filter(x=>daysTo(x.expiry)>30&&daysTo(x.expiry)<=60),d90=c.filter(x=>daysTo(x.expiry)>60&&daysTo(x.expiry)<=90);let filtered=c.filter(x=>(STATE.expiryRange==='all'||(STATE.expiryRange==='expired'&&daysTo(x.expiry)<0)||(STATE.expiryRange==='30'&&daysTo(x.expiry)>=0&&daysTo(x.expiry)<=30)||(STATE.expiryRange==='60'&&daysTo(x.expiry)>30&&daysTo(x.expiry)<=60)||(STATE.expiryRange==='90'&&daysTo(x.expiry)>60&&daysTo(x.expiry)<=90))&&matches(x.product||{},STATE.expiryQuery,[x.position,x.expiry,x.name].join(' '))).sort((a,b)=>a.expiry.localeCompare(b.expiry));return `${header('Caducidades','Control de fechas de vencimiento a partir de los conteos físicos registrados.',`<button class="btn btn-outline" data-action="export-expiry">${I('download')} Exportar reporte</button>`)}<div class="kpi-grid">${kpi('Vencidos',nfmt(expir.reduce((a,x)=>a+Number(x.qty),0)),'alert','red',`${expir.length} registros`)}${kpi('Próx. 30 días',nfmt(d30.reduce((a,x)=>a+Number(x.qty),0)),'clock','amber',`${d30.length} registros`)}${kpi('Entre 31 y 60',nfmt(d60.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}${kpi('Entre 61 y 90',nfmt(d90.reduce((a,x)=>a+Number(x.qty),0)),'calendar','','Unidades')}</div><section class="surface pad"><div class="surface-head"><div><h3 class="surface-title">Vencimientos por caja</h3></div></div><div class="toolbar" style="margin-bottom:13px"><div class="search-wrap">${I('search')}<input class="input" id="expiry-search" placeholder="Buscar producto, código, caja o colaborador…" value="${escapeHtml(STATE.expiryQuery)}"></div><select class="select" id="expiry-range"><option value="all">Todas las fechas</option><option value="expired" ${STATE.expiryRange==='expired'?'selected':''}>Vencidos</option><option value="30" ${STATE.expiryRange==='30'?'selected':''}>0–30 días</option><option value="60" ${STATE.expiryRange==='60'?'selected':''}>31–60 días</option><option value="90" ${STATE.expiryRange==='90'?'selected':''}>61–90 días</option></select></div><div id="expiry-table">${expiryTable(filtered)}</div></section>`}
 function expiryTable(rows){return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Producto / código</th><th>Posición</th><th class="right">Cantidad</th><th>Caducidad</th><th>Estado</th><th>Colaborador</th><th class="right">Acciones</th></tr></thead><tbody>${rows.slice(0,120).map(c=>{let days=daysTo(c.expiry),cls=days<0?'missing':days<=30?'extra':'ok';return `<tr><td><div class="product-name" title="${escapeHtml(c.product?.name||'Producto no encontrado')}">${escapeHtml(c.product?.name||'Producto no encontrado')}</div><span class="product-code">${escapeHtml(c.product?.code||'—')}</span></td><td>${escapeHtml(c.position||'—')}</td><td class="right bold">${nfmt(c.qty)}</td><td>${formatDate(c.expiry)}</td><td><span class="state ${cls}">${days<0?'Vencido':days===0?'Vence hoy':days+' días'}</span></td><td>${escapeHtml(c.name)}</td><td class="right"><button class="btn btn-outline btn-icon" title="Editar registro" data-action="${c.isSurplus?'edit-surplus':'edit-count'}" data-id="${c.id}">${I('edit')}</button> <button class="btn btn-danger btn-icon" title="Borrar registro" data-action="${c.isSurplus?'delete-surplus':'delete-count'}" data-id="${c.id}">${I('trash')}</button></td></tr>`}).join('')||`<tr><td class="empty" colspan="7">Sin registros para este filtro.</td></tr>`}</tbody></table></div>${rows.length>120?`<p class="small muted" style="margin-top:12px">Se muestran los primeros 120 registros. Utiliza el buscador o exporta el reporte completo.</p>`:''}`}
@@ -1382,14 +1475,210 @@ function resetModal(mode){
  showModal(names[mode],`<form data-form="reset-data" class="form-stack"><input type="hidden" name="mode" value="${mode}"><div class="note danger-note">${details[mode]}<br><strong>No hay opción de deshacer.</strong></div><div class="field"><label>Para confirmar, escribe exactamente: <strong>${phrase}</strong></label><input class="input" name="confirmText" autocomplete="off" required placeholder="${phrase}"></div><div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button type="submit" class="btn btn-danger">${I('trash')} Confirmar eliminación</button></div></form>`);
 }
 // Conciliación de facturas. Preserva los IDs de los SKU y nunca modifica counts, markers o reconteos.
+// ACTUALIZACIÓN DIARIA: Excel con stock final o ventas y PVP nuevo. Compra por factura sigue independiente.
+// No reescribir todo el catálogo ni recalcular el stock en cada búsqueda.
+let BULK_UPDATE_REVIEW=null;
+function pfDailyOpen(){
+ if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected){notify('Abre Supervisión y espera la conexión de Firebase.','error');return}
+ BULK_UPDATE_REVIEW=null;
+ showModal('Actualizar inventario',`<div class="form-stack">
+ <div class="note"><b>Elige qué contiene tu Excel.</b> Puedes cambiar el PVP junto al stock. Los campos vacíos no se modifican.</div>
+ <form class="form-stack" data-form="pf-daily-upload">
+ <div class="field"><label>Tipo de actualización</label><select name="mode" class="input" required>
+ <option value="final">Stock final y/o PVP (establecer existencias actuales)</option>
+ <option value="ventas">Ventas del período y/o PVP (descontar unidades vendidas)</option>
+ </select></div>
+ <div class="import-zone">${I('file')}<b>Archivo Excel (.xlsx) o CSV</b><span class="small muted">Usa el botón Plantilla Excel y completa Stock nuevo, Unidades vendidas o PVP nuevo.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div>
+ <div class="invoice-note">No cargues una factura de compra aquí: las compras se <b>suman</b> por el flujo «Agregar stock por factura». El stock final <b>reemplaza</b> solo los códigos incluidos; las ventas <b>restan</b> unidades.</div>
+ <div class="dialog-footer" style="flex-wrap:wrap"><button type="button" class="btn btn-outline" data-action="pf-daily-manual">Editar un producto</button><button type="button" class="btn btn-outline" data-action="pf-daily-template">${I('download')} Plantilla Excel</button><button type="button" class="btn btn-outline" data-action="update-theory">Agregar stock por factura</button><button type="submit" class="btn btn-primary">Revisar cambios</button></div>
+ </form></div>`);
+}
+function pfDailyManualOpen(){
+ if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected)throw Error('Espera a que Firebase esté conectado.');
+ showModal('Modificar un producto',`<div class="form-stack">
+ <div class="field"><label>Buscar por nombre o código</label><input id="pfDailyManualSearch" class="input" autocomplete="off" placeholder="Escribe el código o nombre…"></div>
+ <div id="pfDailyManualList"></div>
+ <div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="stock-price-open">Volver</button></div></div>`);
+ pfDailyManualResults('');
+ document.getElementById('pfDailyManualSearch')?.focus();
+}
+function pfDailyManualResults(term){
+ const target=document.getElementById('pfDailyManualList');if(!target)return;
+ const q=norm(term).trim();
+ const products=STORE.products.filter(p=>!q||norm(p.name).includes(q)||norm(p.code).includes(q)).slice(0,16);
+ target.innerHTML=`<div class="invoice-preview-scroller" style="max-height:360px">${products.map(p=>`<button type="button" class="btn btn-outline" style="width:100%;text-align:left;margin:3px 0" data-action="pf-daily-select" data-id="${escapeHtml(p.id)}"><strong>${escapeHtml(p.name)}</strong><small style="display:block">${escapeHtml(p.code)} · Stock ${p.theoretical} · PVP ${p.pvp==null?'pendiente':'$'+Number(p.pvp).toFixed(2)}</small></button>`).join('')||'<p class="muted">Sin coincidencias.</p>'}</div>`;
+}
+function pfDailyManualSelect(id){
+ const product=STORE.products.find(p=>p.id===id);
+ if(!product)throw Error('Producto no encontrado.');
+ showModal('Actualizar stock y PVP',`<form class="form-stack" data-form="pf-daily-manual-prepare">
+ <input type="hidden" name="skuId" value="${escapeHtml(id)}">
+ <div class="note"><b>${escapeHtml(product.name)}</b><br>Código: ${escapeHtml(product.code)} · Stock actual: ${Number(product.theoretical)||0} · PVP actual: ${product.pvp==null?'Sin PVP':'$'+Number(product.pvp).toFixed(2)}</div>
+ <div class="field"><label>Operación de stock</label><select class="input" name="mode"><option value="final">Establecer stock final</option><option value="ventas">Descontar venta</option></select></div>
+ <div class="field"><label>Cantidad (opcional si solo cambia PVP)</label><input class="input" type="number" min="0" step="1" name="qty" placeholder="Deja vacío para no cambiar el stock"></div>
+ <div class="field"><label>Nuevo PVP (opcional)</label><input class="input" type="number" min="0.01" step="0.01" name="pvp" placeholder="Deja vacío si no cambia el precio"></div>
+ <div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="pf-daily-manual">Volver a buscar</button><button type="submit" class="btn btn-primary">Revisar actualización</button></div></form>`);
+}
+function pfDailyManualPrepare(fd){
+ const product=STORE.products.find(p=>p.id===String(fd.skuId||''));if(!product)throw Error('Producto no encontrado.');
+ const mode=String(fd.mode||'final');if(!['final','ventas'].includes(mode))throw Error('Operación inválida.');
+ const qty=pfDailyNumber(fd.qty),pvp=pfDailyNumber(fd.pvp,true);
+ if((qty===null&&pvp===null)||Number.isNaN(qty)||Number.isNaN(pvp)||pvp===0||(mode==='ventas'&&qty===0))throw Error('Indica una cantidad válida o un nuevo PVP mayor que cero.');
+ const initialQty=Number(product.theoretical)||0;
+ const resulting=mode==='ventas'?initialQty-(qty||0):(qty??initialQty);
+ if(!Number.isSafeInteger(resulting)||resulting<0||resulting>10000000)throw Error('La cantidad supera el stock disponible o está fuera de rango.');
+ const initialPvp=product.pvp==null?null:Number(product.pvp);
+ if(resulting===initialQty&&(pvp===null||pvp===initialPvp))throw Error('No existen cambios por guardar.');
+ BULK_UPDATE_REVIEW={rows:[{id:product.id,code:product.code,name:product.name,initialQty,initialPvp,qty,pvp,resulting}],mode,importKey:'ajuste-manual-'+strId(),fileName:'Edición manual',applied:false,skipped:0};
+ pfDailyReviewDisplay();
+}
+// El buscador manual filtra el catálogo en memoria, sin consultas a Firestore.
+document.addEventListener('input',e=>{if(e.target?.id==='pfDailyManualSearch')pfDailyManualResults(e.target.value)});
+
+async function pfDailyTemplate(){
+ if(!STORE.products.length)throw Error('Primero espera a que cargue el inventario.');
+ const rows=STORE.products.map(p=>({
+   'Código':String(p.code||''),'Producto':String(p.name||''),
+   'Stock actual (referencia)':Number(p.theoretical)||0,
+   'Stock nuevo':'','Unidades vendidas':'',
+   'PVP actual (referencia)':p.pvp==null?'':Number(p.pvp),
+   'PVP nuevo':''
+ }));
+ await exportXlsx(rows,'PuntoFarma_Plantilla_Actualizar_Stock_PVP.xlsx');
+}
+function pfDailyKeyMap(row){return Object.fromEntries(Object.entries(row).map(([k,v])=>[norm(k).replace(/\s+/g,''),v]))}
+function pfDailyField(row,names){
+ for(const n of names){const v=row[norm(n).replace(/\s+/g,'')];if(v!=null&&String(v).trim()!=='')return String(v).trim()}
+ return '';
+}
+function pfDailyNumber(raw,money=false){
+ if(raw===''||raw==null)return null;
+ let s=String(raw).trim().replace(/[$\s]/g,'');
+ if(s.includes(',')&&s.includes('.'))s=s.lastIndexOf(',')>s.lastIndexOf('.')?s.replace(/\./g,'').replace(',','.'):s.replace(/,/g,'');
+ else if(s.includes(','))s=s.replace(',','.');
+ if(!/^[+]?(?:\d+)(?:\.\d+)?$/.test(s))return NaN;
+ const n=Number(s);return Number.isFinite(n)&&(money?n>=0&&n<=999999:Number.isSafeInteger(n)&&n>=0&&n<=10000000)?n:NaN;
+}
+function pfDailyMatch(code,name){
+ const same=STORE.products.filter(p=>String(p.code||'').trim()===code);
+ if(same.length===1)return same[0];
+ if(same.length>1&&name){const exact=same.filter(p=>norm(p.name).trim()===norm(name).trim());if(exact.length===1)return exact[0]}
+ return null;
+}
+async function pfDailyRead(file,mode){
+ if(!['final','ventas'].includes(mode))throw Error('Selecciona un modo válido.');
+ if(!file||file.size>12*1024*1024)throw Error('Selecciona un archivo de hasta 12 MB.');
+ const raw=await invoiceRawRows(file);
+ if(!raw.length||raw.length>15000)throw Error('Excel vacío o demasiado grande. Máximo 15.000 filas.');
+ const data=new Map(),issues=[],skipped=[];
+ for(let i=0;i<raw.length;i++){
+   const record=pfDailyKeyMap(raw[i]);
+   const code=pfDailyField(record,['Código','Codigo de barras','Codigo barras','SKU','Code']).replace(/\.0$/,'').trim();
+   const name=pfDailyField(record,['Producto','Nombre','Descripción','Descripcion','Item','Item / Producto']);
+   const qtyText=mode==='ventas'?pfDailyField(record,['Unidades vendidas','Cantidad vendida','Vendidas','Cantidad ventas','Cantidad']):pfDailyField(record,['Stock nuevo','Nuevo stock','Stock final','Stock actualizado','Existencia nueva','Existencias nuevas']);
+   const priceText=pfDailyField(record,['PVP nuevo','Nuevo PVP','Precio nuevo','Precio de venta nuevo','PVP','Precio venta']);
+   if(qtyText===''&&priceText==='')continue;
+   if(!code){issues.push(`Fila ${i+2}: falta el código`);continue}
+   const product=pfDailyMatch(code,name);
+   if(!product){issues.push(`Fila ${i+2}: código ${code} no encontrado o repetido sin nombre exacto`);continue}
+   const qty=pfDailyNumber(qtyText),pvp=pfDailyNumber(priceText,true);
+   if(Number.isNaN(qty)||Number.isNaN(pvp)||pvp===0){issues.push(`Fila ${i+2}: stock, ventas o PVP inválidos`);continue}
+   if(mode==='ventas'&&qty===0){issues.push(`Fila ${i+2}: la cantidad vendida debe ser mayor que cero`);continue}
+   const prev=data.get(product.id);
+   if(prev){
+     if(mode==='ventas'){
+       if(qty!==null)prev.qty=(prev.qty??0)+qty;
+       if(pvp!==null&&prev.pvp!==null&&pvp!==prev.pvp){issues.push(`Fila ${i+2}: dos precios distintos para ${code}`);continue}
+       if(pvp!==null)prev.pvp=pvp;
+     }else if((qty!==null&&prev.qty!==null&&prev.qty!==qty)||(pvp!==null&&prev.pvp!==null&&prev.pvp!==pvp)){
+       issues.push(`Fila ${i+2}: dos cantidades o PVP distintos para ${code}`);
+     }else {if(qty!==null)prev.qty=qty;if(pvp!==null)prev.pvp=pvp}
+   }else data.set(product.id,{id:product.id,code:product.code,name:product.name,qty,pvp,initialQty:Number(product.theoretical)||0,initialPvp:product.pvp==null?null:Number(product.pvp)});
+ }
+ if(issues.length)throw Error(`Revisa ${issues.length} fila(s). ${issues.slice(0,4).join(' · ')}. Ningún dato fue modificado.`);
+ const rows=[];
+ for(const a of data.values()){
+   const resulting=mode==='ventas'?a.initialQty-(a.qty||0):(a.qty??a.initialQty);
+   if(!Number.isSafeInteger(resulting)||resulting<0||resulting>10000000){issues.push(`${a.code}: las ventas exceden el stock o la cantidad está fuera de rango`);continue}
+   if(resulting===a.initialQty&&(a.pvp===null||a.pvp===a.initialPvp)){skipped.push(a.code);continue}
+   rows.push({...a,resulting});
+ }
+ if(issues.length)throw Error(`${issues.slice(0,4).join(' · ')}. Ningún dato fue modificado.`);
+ if(!rows.length)throw Error('El Excel no contiene cambios de stock ni de PVP respecto al inventario cargado.');
+ const digest=await crypto.subtle.digest('SHA-256',await file.arrayBuffer());
+ const hash=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('').slice(0,36);
+ BULK_UPDATE_REVIEW={rows,mode,fileName:file.name,importKey:'ajuste-'+mode+'-'+hash,applied:false,skipped:skipped.length};
+ pfDailyReviewDisplay();
+}
+function pfDailyReviewDisplay(){
+ const review=BULK_UPDATE_REVIEW;if(!review)return;
+ const stockChanges=review.rows.filter(r=>r.resulting!==r.initialQty).length;
+ const priceChanges=review.rows.filter(r=>r.pvp!==null&&r.pvp!==r.initialPvp).length;
+ showModal('Confirmar actualización',`<div class="form-stack">
+ <div class="note"><b>${review.mode==='ventas'?'DESCONTAR VENTAS':'ACTUALIZAR STOCK FINAL'}.</b> Se modificarán únicamente ${review.rows.length} productos. ${stockChanges} cambios de stock y ${priceChanges} de PVP. Los precios vacíos permanecen intactos.</div>
+ <div class="invoice-preview-scroller"><table class="invoice-review-table"><thead><tr><th>Código / producto</th><th>Stock antes</th><th>Stock después</th><th>PVP antes</th><th>PVP después</th></tr></thead><tbody>
+ ${review.rows.slice(0,150).map(r=>`<tr><td><strong>${escapeHtml(String(r.code))}</strong><small style="display:block">${escapeHtml(String(r.name))}</small></td><td>${r.initialQty}</td><td><b>${r.resulting}</b></td><td>${r.initialPvp==null?'Sin PVP':'$'+r.initialPvp.toFixed(2)}</td><td>${r.pvp==null?'Sin cambios':'$'+r.pvp.toFixed(2)}</td></tr>`).join('')}
+ </tbody></table></div>
+ ${review.rows.length>150?`<p class="muted small">Se muestran 150 de ${review.rows.length} filas. Se aplicarán todos los cambios revisados en el archivo.</p>`:''}
+ <form class="form-stack" data-form="pf-daily-apply"><div class="field"><label><input type="checkbox" name="confirmed" value="yes" required> Confirmo las cantidades y precios. Sé que el stock actualizado afectará las diferencias con los conteos históricos.</label></div>
+ <div id="pfDailyProgress" class="small muted">El guardado actualizará Inventario y Atención al Cliente juntos por producto.</div>
+ <div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="stock-price-open">Volver</button><button type="submit" class="btn btn-primary">Confirmar y guardar cambios</button></div></form></div>`);
+ document.querySelector('#modal-layer .dialog')?.style.setProperty('max-width','1060px');
+}
+async function pfDailyApply(){
+ const review=BULK_UPDATE_REVIEW;if(!review||review.applied)throw Error('Primero revisa un Excel nuevo.');
+ if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected)throw Error('Se requiere conexión de Supervisión.');
+ let applied=0,already=0,nochange=0;
+ for(const row of review.rows){
+   const product=STORE.products.find(p=>p.id===row.id);
+   if(!product)throw Error('El catálogo cambió durante el proceso. Revisa el inventario y repite el archivo original.');
+   let result;
+   if(STORE.appMode==='demo'){
+     if(!STORE.pfAppliedDaily)STORE.pfAppliedDaily=new Set();
+     const key=review.importKey+':'+row.id;
+     if(STORE.pfAppliedDaily.has(key))result={state:'duplicado'};
+     else {STORE.pfAppliedDaily.add(key);Object.assign(product,{theoretical:row.resulting,...(row.pvp!==null?{pvp:row.pvp}:{})});result={state:'aplicado',qty:row.resulting,pvp:row.pvp};syncLocal()}
+   }else{
+     const {fsm,db}=fb;
+     const stockRef=fsm.doc(db,'stock',row.id),serviceRef=fsm.doc(db,'service_products',row.id);
+     result=await fsm.runTransaction(db,async tx=>{
+       const snap=await tx.get(stockRef);
+       if(!snap.exists())throw Error('No existe el stock de '+row.code+'. Vuelve a cargar la página.');
+       const old=snap.data();const imports=Array.isArray(old.appliedStockImports)?old.appliedStockImports:[];
+       const currentQty=Number(old.theoretical);const oldPvp=old.pvp==null?null:Number(old.pvp);
+       if(imports.includes(review.importKey))return {state:'duplicado'};
+       if(!Number.isSafeInteger(currentQty)||currentQty<0)throw Error('Stock actual inválido en '+row.code);
+       if(row.qty!==null&&currentQty!==row.initialQty)throw Error('El stock de '+row.code+' cambió desde la vista previa. No se sobrescribió; actualiza y revisa de nuevo.');
+       if(row.pvp!==null&&oldPvp!==row.initialPvp)throw Error('El PVP de '+row.code+' cambió desde la vista previa. No se sobrescribió.');
+       const nextQty=review.mode==='ventas'?currentQty-(row.qty||0):row.qty??currentQty;
+       if(!Number.isSafeInteger(nextQty)||nextQty<0||nextQty>10000000)throw Error('Stock insuficiente o inválido en '+row.code);
+       const nextPrice=row.pvp??oldPvp;
+       // Marcar el archivo EN EL MISMO documento evita aplicar la misma venta dos veces.
+       tx.update(stockRef,{theoretical:nextQty,...(row.pvp!==null?{pvp:row.pvp}:{}),appliedStockImports:[...imports,review.importKey],lastStockAdjustmentAt:new Date().toISOString(),lastStockAdjustmentKind:review.mode});
+       tx.set(serviceRef,serviceProjection({...product,...old,theoretical:nextQty,pvp:nextPrice}),{merge:true});
+       return {state:'aplicado',qty:nextQty,pvp:nextPrice};
+     });
+   }
+   if(result.state==='duplicado')already++;
+   else if(result.state==='aplicado'){
+     applied++;product.theoretical=result.qty;if(result.pvp!==null)product.pvp=result.pvp;
+   }else nochange++;
+   const progress=document.getElementById('pfDailyProgress');
+   if(progress)progress.textContent=`Procesados ${applied+already+nochange} de ${review.rows.length}. Guardados ${applied}; duplicados omitidos ${already}.`;
+ }
+ review.applied=true;
+ closeModal();render();
+ notify(`Actualización completa: ${applied} productos guardados y sincronizados, ${already} ya aplicados. No se alteraron conteos ni ubicaciones.`);
+}
+
 function invoiceUpdateModal(){
  if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected){notify('Abre Supervisión y espera a que Firebase esté conectado antes de actualizar.','error');return}
  INVOICE_REVIEW=null;
- showModal('Actualizar stock teórico desde facturas',`<form class="form-stack" data-form="invoice-upload"><div class="note"><b>Actualización sin borrar conteos.</b> El nuevo Excel reemplazará el teórico únicamente de los códigos que se confirmen. Los SKU ausentes se conservarán. Los conteos, colaboradores, posiciones, caducidades y reconteos permanecerán intactos.</div><div class="import-zone">${I('file')}<b>Selecciona tu consolidado de facturas</b><span class="small muted">Excel (.xlsx / .xls) o CSV. Encabezados esperados: Código de barras, Ítem / Producto y Cantidad.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div><div class="invoice-note">La columna Cantidad puede representar cajas. Revisaremos los factores x6, x50, x100 antes de convertir a unidades. No se aplican multiplicaciones silenciosas.</div><div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button class="btn btn-primary" type="submit">Comparar con mi inventario</button></div></form>`);
+ showModal('Agregar stock desde factura',`<form class="form-stack" data-form="invoice-upload"><div class="note"><b>Esta operación SUMA y publica en Atención al Cliente.</b> Los códigos existentes aumentan sus unidades teóricas, los nuevos se incorporan al catálogo y los demás quedan intactos. No modifica conteos, reconteos, ubicaciones ni PVP.</div><div class="import-zone">${I('file')}<b>Selecciona tu consolidado de facturas</b><span class="small muted">Excel (.xlsx / .xls) o CSV. Encabezados esperados: Código de barras, Ítem / Producto y Cantidad.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div><div class="invoice-note">La columna Cantidad puede representar cajas. Revisaremos los factores x6, x50, x100 antes de convertir a unidades. No se aplican multiplicaciones silenciosas.</div><div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button class="btn btn-primary" type="submit">Comparar con mi inventario</button></div></form>`);
 }
 async function invoiceRawRows(file){
  if(file.name.toLowerCase().endsWith('.csv'))return csvParse(await file.text());
- if(!window.XLSX)await new Promise((ok,no)=>{const scr=document.createElement('script');scr.src='https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';scr.onload=ok;scr.onerror=()=>no(Error('No se pudo abrir el lector de Excel. Comprueba internet.'));document.head.appendChild(scr)});
+ await pfEnsureXlsx();
  const wb=window.XLSX.read(await file.arrayBuffer(),{type:'array'});
  const sheet=wb.Sheets[wb.SheetNames[0]];
  return window.XLSX.utils.sheet_to_json(sheet,{raw:false,defval:''});
@@ -1435,7 +1724,9 @@ async function invoiceOpenPreview(file){
  }
  if(errors.length)throw Error(`${errors.length} filas necesitan corrección (${errors.slice(0,3).join(' · ')}). No se aplicó ningún cambio.`);
  if(!group.size)throw Error('El archivo no contiene las columnas Código de barras, Ítem / Producto y Cantidad.');
- INVOICE_REVIEW={fileName:file.name,items:[...group.values()],current:0,filter:'all',confirmed:false,backedUp:false,sourceRows:totalRaw,openedAt:now(),snapshot:STORE.products.map(p=>({id:p.id,theoretical:p.theoretical})),applied:false,links:[],linkPage:0};
+ const fileHash=await crypto.subtle.digest('SHA-256',await file.arrayBuffer());
+ const importKey='factura-'+[...new Uint8Array(fileHash)].map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
+ INVOICE_REVIEW={fileName:file.name,importKey,items:[...group.values()],current:0,filter:'all',confirmed:false,backedUp:false,sourceRows:totalRaw,openedAt:now(),snapshot:STORE.products.map(p=>({id:p.id,theoretical:p.theoretical})),applied:false,links:[],linkPage:0};
  for(const a of INVOICE_REVIEW.items){
    const suggest=invoiceSuggestedFactor(a.name);a.suggested=suggest.n;a.hint=suggest.kind;
    a.factor=1;a.factorConfirmed=suggest.n===1;a.quantityOverride=null;
@@ -1450,23 +1741,27 @@ function invoicePlannedProducts(){
  return INVOICE_REVIEW.items.map(a=>{
    const existing=STORE.products.find(p=>p.id===a.targetId);
    const qty=invoiceProposedQty(a);
-   return cleanSku({...(existing||{}),id:existing?.id||a.newId,code:a.code,
+   const prior=existing?Number(existing.theoretical)||0:0;
+   return cleanSku({...(existing||{}),id:existing?.id||a.newId,code:existing?.code||a.code,
      name:existing?.name||a.name,category:existing?.category||a.category||'',
      presentation:existing?.presentation||(a.factor>1?'CAJA':'UNIDAD'),
-     unitsPerPresentation:a.factor,packs:a.packs,theoretical:qty,
-     costTotal:a.costTotal,costUnit:qty?a.costTotal/qty:0,
-     unitReviewResolved:true,sourceRows:existing?.sourceRows||[]});
+     unitsPerPresentation:existing?.unitsPerPresentation||(a.factor||1),
+     packs:existing?.packs||a.packs,theoretical:prior+qty,
+     // No se alteran precios PVP ni costos por la recepción de una factura.
+     costTotal:existing?.costTotal||0,costUnit:existing?.costUnit||0,
+     unitReviewResolved:existing?.unitReviewResolved===true||!existing,
+     sourceRows:existing?.sourceRows||[]});
  });
 }
 function invoiceIssues(){if(!INVOICE_REVIEW)return [];
  const a=INVOICE_REVIEW.items;
  const choices=a.filter(p=>!p.targetId);
  const factors=a.filter(p=>!p.factorConfirmed);
- const bad=a.filter(p=>!Number.isSafeInteger(invoiceProposedQty(p))||invoiceProposedQty(p)<0||invoiceProposedQty(p)>10000000);
+ const bad=a.filter(p=>!Number.isSafeInteger(invoiceProposedQty(p))||invoiceProposedQty(p)<=0||invoiceProposedQty(p)>10000000);
  const duplicateIds=new Set();const assigned=new Set();for(const p of a){let id=p.targetId==='NEW'?p.newId:p.targetId;if(assigned.has(id))duplicateIds.add(id);assigned.add(id)}
  return [...(choices.length?[`${choices.length} coincidencias ambiguas`]:[]),...(factors.length?[`${factors.length} presentaciones sin validar`]:[]),...(bad.length?[`${bad.length} cantidades inválidas`]:[]),...(duplicateIds.size?[`${duplicateIds.size} destinos repetidos`]:[])];
 }
-function invoiceRowType(a){if(!a.targetId)return'Pendiente';return a.targetId==='NEW'?'Nuevo':'Actualiza'}
+function invoiceRowType(a){if(!a.targetId)return'Pendiente';return a.targetId==='NEW'?'Producto nuevo':'Sumar a existente'}
 function invoiceRowMarkup(a){
  const existing=STORE.products.find(p=>p.id===a.targetId);const candidates=STORE.products.filter(p=>p.code===a.code),qty=invoiceProposedQty(a);
  const warning=!a.targetId||!a.factorConfirmed||!Number.isSafeInteger(qty);
@@ -1474,7 +1769,7 @@ function invoiceRowMarkup(a){
  return `<tr><td><strong>${escapeHtml(a.name)}</strong><small style="display:block;color:#71889b">${escapeHtml(a.code)} · ${a.sourceLines} línea(s)</small>${a.renamed?'<small style="color:#a47715">Nombre distinto al catálogo; conservaremos el anterior</small>':''}</td>
  <td><span class="tag ${warning?'warn':a.targetId==='NEW'?'good':''}">${invoiceRowType(a)}</span><div style="margin-top:5px"><select aria-label="Destino del código ${escapeHtml(a.code)}" data-invoice-target="${escapeHtml(a.key)}">${opts}</select></div></td>
  <td>${nfmt(a.packs)}</td><td><input aria-label="Unidades por presentación" type="number" inputmode="numeric" min="1" max="1000" step="1" data-invoice-factor="${escapeHtml(a.key)}" value="${a.factor}"><small style="display:block;color:${a.factorConfirmed?'#557d91':'#b47d1e'}">${a.factorConfirmed?'Validado':'Sugerido: '+nfmt(a.suggested)+' ('+escapeHtml(a.hint)+')'}</small></td>
- <td><input aria-label="Cantidad teórica en unidades" type="number" inputmode="numeric" min="0" max="10000000" step="1" data-invoice-qty="${escapeHtml(a.key)}" value="${qty}"></td><td>${existing?nfmt(existing.theoretical):'Nuevo'}</td></tr>`;
+ <td><input aria-label="Unidades a SUMAR" type="number" inputmode="numeric" min="1" max="10000000" step="1" data-invoice-qty="${escapeHtml(a.key)}" value="${qty}"></td><td>${existing?nfmt(existing.theoretical):'0 (nuevo)'}</td><td><b>${nfmt((existing?Number(existing.theoretical)||0:0)+qty)}</b></td></tr>`;
 }
 function invoiceRenderReview(){
  if(!INVOICE_REVIEW)return;
@@ -1485,14 +1780,14 @@ function invoiceRenderReview(){
  const candidates=rev.filter==='pending'?pending:rev.filter==='new'?all.filter(a=>a.targetId==='NEW'):rev.filter==='changed'?all.filter(a=>a.targetId&&a.targetId!=='NEW'):all;
  const start=rev.current*55;const page=candidates.slice(start,start+55),totalPages=Math.max(1,Math.ceil(candidates.length/55));
  if(rev.current>=totalPages){rev.current=0;return invoiceRenderReview()}
- showModal('Vista previa · actualizar stock teórico',`<div class="invoice-review-dialog"><div class="note">Archivo: <b>${escapeHtml(rev.fileName)}</b>. No se modificó Firebase. Las referencias del catálogo actual conservan su identificador y sus conteos físicos.</div>
+ showModal('Vista previa · SUMAR stock',`<div class="invoice-review-dialog"><div class="note">Archivo: <b>${escapeHtml(rev.fileName)}</b>. No se modificó Firebase. Las referencias del catálogo actual conservan su identificador y sus conteos físicos.</div>
  <div class="invoice-status"><span>Códigos facturados<b>${all.length}</b></span><span>Actualizaciones<b>${existing}</b></span><span>Nuevas referencias<b>${newCount}</b></span><span>Sin alterar (catálogo)<b>${preserved}</b></span><span>Por resolver<b>${pending.length}</b></span></div>
- <div class="invoice-note"><b>Unidades por presentación:</b> se supone 1 hasta que confirmes cada xN. Puedes editar el factor, escribir directamente las unidades teóricas o aprobar sugerencias explícitamente. Las referencias ausentes de las facturas NO serán eliminadas.</div>
+ <div class="invoice-note"><b>Revisa cantidades:</b> unidades a sumar = cantidad facturada × factor. Comprueba cajas x24, x30 o x100 antes de confirmar. Ninguna referencia existente se reemplaza; los códigos no facturados permanecen intactos. El stock teórico aumenta y las diferencias con conteos anteriores pueden cambiar.</div>
  <div class="invoice-review-actions"><select id="invoice-filter" class="select"><option value="all" ${rev.filter==='all'?'selected':''}>Todos</option><option value="pending" ${rev.filter==='pending'?'selected':''}>Solo pendientes</option><option value="new" ${rev.filter==='new'?'selected':''}>Nuevos</option><option value="changed" ${rev.filter==='changed'?'selected':''}>Actualizados</option></select><button type="button" class="btn btn-outline btn-sm" data-action="invoice-suggested">Aplicar factores sugeridos</button><button type="button" class="btn btn-outline btn-sm" data-action="invoice-assume-units">Confirmar como unidades (x1)</button><button type="button" class="btn btn-outline btn-sm" data-action="invoice-preview-export">Descargar propuesta Excel</button></div>
- <div class="invoice-preview-scroller"><table class="invoice-review-table"><thead><tr><th>Producto de factura / código</th><th>Vincular con catálogo</th><th>Facturado</th><th>Unid. por presentación</th><th>Teórico nuevo (und.)</th><th>Teórico anterior</th></tr></thead><tbody>${page.map(invoiceRowMarkup).join('')||'<tr><td colspan="6" class="empty">No hay filas en este filtro.</td></tr>'}</tbody></table></div>
+ <div class="invoice-preview-scroller"><table class="invoice-review-table"><thead><tr><th>Producto de factura / código</th><th>Vincular con catálogo</th><th>Facturado</th><th>Unid. por presentación</th><th>Unidades a SUMAR</th><th>Teórico actual</th><th>Teórico resultante</th></tr></thead><tbody>${page.map(invoiceRowMarkup).join('')||'<tr><td colspan="7" class="empty">No hay filas en este filtro.</td></tr>'}</tbody></table></div>
  <div class="pagination"><span>${candidates.length} referencias · página ${rev.current+1} de ${totalPages}</span><div class="pagebtns"><button type="button" data-action="invoice-previous" ${rev.current===0?'disabled':''}>‹</button><button type="button" data-action="invoice-next" ${rev.current>=totalPages-1?'disabled':''}>›</button></div></div>
  <div class="invoice-note" id="invoice-validation"></div><div class="invoice-review-actions"><button type="button" class="btn btn-outline" data-action="invoice-backup">${I('download')} Descargar respaldo completo</button><label class="invoice-link-label"><input type="checkbox" id="invoice-backup-ready" ${rev.backedUp?'checked':''}> Guardé el respaldo</label></div>
- <form class="form-stack" data-form="invoice-apply"><label class="invoice-link-label"><input id="invoice-confirm" type="checkbox" ${rev.confirmed?'checked':''}> Confirmo que revisé el stock en unidades; no se tocarán los conteos físicos.</label><div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button class="btn btn-primary" id="invoice-apply-button" type="submit">Aplicar nuevo stock teórico</button></div></form></div>`);
+ <form class="form-stack" data-form="invoice-apply"><label class="invoice-link-label"><input id="invoice-confirm" type="checkbox" ${rev.confirmed?'checked':''}> Confirmo las unidades a sumar y que los conteos físicos no se modificarán.</label><div class="dialog-footer"><button type="button" class="btn btn-outline" data-action="close-modal">Cancelar</button><button class="btn btn-primary" id="invoice-apply-button" type="submit">Confirmar y SUMAR stock</button></div></form></div>`);
  const dialog=document.querySelector('#modal-layer .dialog');if(dialog)dialog.style.maxWidth='1180px';
  invoiceRefreshControls();
 }
@@ -1503,7 +1798,7 @@ function invoiceRefreshControls(){
 }
 function invoiceItem(key){const item=INVOICE_REVIEW?.items.find(a=>a.key===key);if(!item)throw Error('Referencia no encontrada en la vista previa.');return item}
 function invoiceEditFactor(key,val){const a=invoiceItem(key),n=Number(val);if(!Number.isSafeInteger(n)||n<1||n>1000){a.factorConfirmed=false;invoiceRefreshControls();return}a.factor=n;a.factorConfirmed=true;a.quantityOverride=null;invoiceRenderReview()}
-function invoiceEditQuantity(key,val){const a=invoiceItem(key),n=Number(val);if(!Number.isSafeInteger(n)||n<0||n>10000000){a.factorConfirmed=false;invoiceRefreshControls();return}a.quantityOverride=n;a.factorConfirmed=true;invoiceRenderReview()}
+function invoiceEditQuantity(key,val){const a=invoiceItem(key),n=Number(val);if(!Number.isSafeInteger(n)||n<=0||n>10000000){a.factorConfirmed=false;invoiceRefreshControls();return}a.quantityOverride=n;a.factorConfirmed=true;invoiceRenderReview()}
 function invoiceChooseTarget(key,val){const a=invoiceItem(key);a.targetId=val;invoiceRenderReview()}
 function invoiceBulkSuggested(){
  if(!INVOICE_REVIEW)return;
@@ -1521,7 +1816,7 @@ function invoiceBackup(){
  const blob=new Blob([JSON.stringify(backup,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`puntofarma_respaldo_pre_facturas_${localToday()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),5000);
  notify('Respaldo descargado. Guárdalo fuera de GitHub.');
 }
-async function invoiceExportPreview(){if(!INVOICE_REVIEW)return;return exportXlsx(INVOICE_REVIEW.items.map(a=>({codigo:a.code,producto:a.name,presentaciones:a.packs,unidadesPorPresentacion:a.factor,totalUnidades:invoiceProposedQty(a),destino:invoiceRowType(a),skuActual:a.targetId||'',precioFactura:a.costTotal,factorValidado:a.factorConfirmed?'SI':'NO'})),'puntofarma_propuesta_stock_facturas.xlsx')}
+async function invoiceExportPreview(){if(!INVOICE_REVIEW)return;return exportXlsx(INVOICE_REVIEW.items.map(a=>({codigo:a.code,producto:a.name,presentaciones:a.packs,unidadesPorPresentacion:a.factor,unidadesASumar:invoiceProposedQty(a),stockActual:STORE.products.find(p=>p.id===a.targetId)?.theoretical||0,stockFinal:invoicePlannedProducts().find(p=>p.id===(a.targetId==='NEW'?a.newId:a.targetId))?.theoretical||0,destino:invoiceRowType(a),skuActual:a.targetId||'',factorValidado:a.factorConfirmed?'SI':'NO'})),'puntofarma_propuesta_SUMAR_stock_facturas.xlsx')}
 async function invoiceApply(){
  if(!INVOICE_REVIEW||INVOICE_REVIEW.applied)throw Error('Primero carga una vista previa nueva.');
  if(invoiceIssues().length)throw Error('Debes resolver todas las coincidencias y presentaciones antes de aplicar.');
@@ -1529,12 +1824,14 @@ async function invoiceApply(){
  const current=INVOICE_REVIEW.snapshot;for(const original of current){const p=STORE.products.find(x=>x.id===original.id);if(!p||Number(p.theoretical)!==Number(original.theoretical))throw Error('El catálogo cambió durante la revisión. Vuelve a cargar y compara para evitar sobrescribir cambios recientes.');}
  const ps=invoicePlannedProducts();if(!ps.length)throw Error('No hay productos.');
  const nNew=INVOICE_REVIEW.items.filter(a=>a.targetId==='NEW').length;
- if(!confirm(`Aplicar ${ps.length} referencias (${nNew} nuevas) a Firestore, conservando conteos, caducidades y SKU no incluidos? El stock teórico cambiará y se recalcularán ERI y diferencias.`))return;
+ const units=INVOICE_REVIEW.items.reduce((sum,a)=>sum+invoiceProposedQty(a),0);
+ if(!confirm(`SUMAR ${units} unidades correspondientes a ${ps.length} productos (${nNew} nuevos) y PUBLICAR esos productos en Atención al Cliente? Los códigos existentes NO se reemplazarán. Los conteos y ubicaciones permanecen intactos.`))return;
  const btn=document.getElementById('invoice-apply-button');if(btn)btn.disabled=true;
- try{await adapter.applyTheoryUpdate(ps,(a,b)=>{const el=document.getElementById('invoice-validation');if(el)el.textContent=`Actualizando stock en Firebase: ${a} de ${b} referencias. No cierres esta página.`;});}
- catch(e){if(btn)btn.disabled=false;throw Error('La actualización se interrumpió. Es posible que algunos lotes ya estén guardados; no vuelvas a aplicar a ciegas. Actualiza la página y realiza una nueva comparación. '+e.message)}
+ let result;
+ try{result=await adapter.applyInvoiceAdditions(INVOICE_REVIEW,(a,b)=>{const el=document.getElementById('invoice-validation');if(el)el.textContent=`Sumando stock en Firebase: ${a} de ${b} referencias. No cierres esta página.`;});}
+ catch(e){if(btn)btn.disabled=false;throw Error('La carga se interrumpió. Los productos confirmados NO se duplicarán si repites exactamente el MISMO archivo. Sin cambiar el archivo, espera la sincronización y vuelve a comparar. '+e.message)}
  INVOICE_REVIEW.applied=true;
- notify(`Stock teórico actualizado: ${ps.length} referencias. Conteos intactos.`);
+ notify(`Factura confirmada: ${result.added} producto(s) sumados y publicados en Atención al Cliente, ${result.skipped} ya procesados. Conteos y ubicaciones intactos.`);
  invoiceReconcileModal();
 }
 function invoiceLinkCandidates(){
@@ -1854,7 +2151,7 @@ document.addEventListener('click',async e=>{let b=e.target.closest('[data-action
    await exportXlsx(filteredRowsCSV(),`puntofarma_${STATE.status}_${localToday()}.xlsx`);
  }else if(action==='sync-progress'){if(STORE.role==='operator'&&refreshMarkerProgress){await refreshMarkerProgress();notify('Avance general actualizado.')}else notify('Los datos ya están actualizados.')}else if(action==='worker-tab'){STATE.workerTab=b.dataset.tab==='surplus'?'surplus':'count';render()}else if(action==='edit-surplus'){editSurplusModal(id)}else if(action==='delete-surplus'){let c=STORE.surplus.find(x=>x.id===id);if(!c)throw Error('Sobrante no encontrado.');if(STORE.role==='operator'&&c.uid!==STORE.uid)throw Error('No puedes borrar registros ajenos.');if(c.linkedSkuId&&STORE.role==='operator')throw Error('Registro conciliado: solicita corrección al supervisor.');if(!confirm('¿Eliminar este sobrante manual?'))return;await adapter.deleteSurplus(id);closeModal();notify('Sobrante eliminado.');if(STORE.appMode==='demo')render()}else if(action==='test-sound'){prepareSound();beep();notify('Sonido de prueba reproducido. Comprueba el volumen del celular.')}else if(action==='back'){STATE.loginType='';render()}else if(action==='role'){STATE.loginType=b.dataset.role;render();if(['operator','recount','locations'].includes(STATE.loginType))await pfLoadWorkerNames()}else if(action==='nav'){STATE.panel=b.dataset.route;STATE.page=0;if(STORE.appMode==='firebase'&&STORE.role==='supervisor'&&refreshSupervisorFeeds)refreshSupervisorFeeds(STATE.panel);render();if(STATE.panel==='locations'&&!STATE.locationSupervisorRequested){STATE.locationSupervisorRequested=true;adapter.loadLocations(STORE.appMode==='firebase').catch(err=>{console.error('Ubicaciones / supervisión',err);notify('No se pudieron cargar ubicaciones: '+String(err.message||err),'error')});}}else if(action==='collapse'){STATE.collapsed=!STATE.collapsed;localStorage.setItem(PREFIX+'collapsed',String(STATE.collapsed));render()}else if(action==='logout'){signOut()}else if(action==='close-modal'){closeModal()}else if(action==='pick-product'){STATE.selected=id;STATE.workerQuery='';let x=document.getElementById('worker-search');if(x)x.value='';updateSuggestions();document.getElementById('worker-qty')?.focus()}else if(action==='clear-product'){STATE.selected=null;STATE.workerQuery='';updateSuggestions();document.getElementById('worker-search')?.focus()}else if(action==='page'){if(b.dataset.kind==='dash')STATE.page+=Number(b.dataset.step);else STATE.invPage+=Number(b.dataset.step);updateTables()}else if(action==='detail'){showDetail(id)}else if(action==='edit-count'){showCountEditor(id)}else if(action==='delete-count'){if(!confirm('¿Eliminar este registro de conteo? Los indicadores se actualizarán automáticamente.'))return;let c=STORE.counts.find(x=>x.id===id);if(STORE.role==='operator'&&c?.uid!==STORE.uid)throw Error('Sin permiso.');await adapter.deleteCount(id);closeModal();notify('Registro eliminado.');if(STORE.appMode==='demo')render()}
  else if(action==='review-units'){showUnitReview(id)}else if(action==='keep-theory'){const p=STORE.products.find(x=>x.id===id);if(!p)throw Error('Producto no encontrado.');if(!confirm('¿Confirmas que el teórico actual está expresado en unidades y NO debe multiplicarse? Se mantendrá la diferencia física.'))return;await adapter.updateProduct(id,{unitReviewResolved:true});closeModal();notify('Confirmado: teórico conservado como unidades.');if(STORE.appMode==='demo')render()}else if(action==='edit-product'){showProductEditor(id)}else if(action==='new-product'){showProductEditor(null)}else if(action==='delete-product'){let p=STORE.products.find(x=>x.id===id);if(!confirm(`¿Eliminar ${p?.name||'este producto'} del catálogo? También se retirará de Reconteo si está enviado. Los conteos históricos se conservarán.`))return;await adapter.deleteProduct(id);notify('Producto eliminado del catálogo y retirado de Reconteo.');if(STORE.appMode==='demo')render()}
- else if(action==='update-theory'){invoiceUpdateModal()}else if(action==='reconcile-existing-surplus'){INVOICE_REVIEW={items:[],applied:true,links:[]};invoiceReconcileModal()}else if(action==='invoice-suggested'){invoiceBulkSuggested()}else if(action==='invoice-assume-units'){invoiceBulkSingle()}else if(action==='invoice-backup'){invoiceBackup()}else if(action==='invoice-preview-export'){await invoiceExportPreview()}else if(action==='invoice-link-review'){invoiceRenderLinks()}else if(action==='invoice-link-toggle'){invoiceToggleLink(id,b.checked)}else if(action==='invoice-link-all'){invoiceSelectSafeLinks()}else if(action==='invoice-link-none'){invoiceClearLinks()}else if(action==='invoice-manual-link'){invoiceManualLinkModal(id)}else if(action==='invoice-previous'){INVOICE_REVIEW.current=Math.max(0,INVOICE_REVIEW.current-1);invoiceRenderReview()}else if(action==='invoice-next'){INVOICE_REVIEW.current++;invoiceRenderReview()}else if(action==='import-modal'){importModal()}else if(action==='reset-modal'){resetModal(b.dataset.mode)}else if(action==='new-admin'){modalNewAdmin()}else if(action==='change-pass'){modalPassword(id)}else if(action==='toggle-user'){if(!confirm('¿Cambiar el estado de este acceso?'))return;await adapter.toggleUser(id);notify('Estado actualizado.');if(STORE.appMode==='demo')render()}
+ else if(action==='stock-price-open'){pfDailyOpen()}else if(action==='pf-daily-manual'){pfDailyManualOpen()}else if(action==='pf-daily-select'){pfDailyManualSelect(id)}else if(action==='pf-daily-template'){await pfDailyTemplate()}else if(action==='update-theory'){invoiceUpdateModal()}else if(action==='reconcile-existing-surplus'){INVOICE_REVIEW={items:[],applied:true,links:[]};invoiceReconcileModal()}else if(action==='invoice-suggested'){invoiceBulkSuggested()}else if(action==='invoice-assume-units'){invoiceBulkSingle()}else if(action==='invoice-backup'){invoiceBackup()}else if(action==='invoice-preview-export'){await invoiceExportPreview()}else if(action==='invoice-link-review'){invoiceRenderLinks()}else if(action==='invoice-link-toggle'){invoiceToggleLink(id,b.checked)}else if(action==='invoice-link-all'){invoiceSelectSafeLinks()}else if(action==='invoice-link-none'){invoiceClearLinks()}else if(action==='invoice-manual-link'){invoiceManualLinkModal(id)}else if(action==='invoice-previous'){INVOICE_REVIEW.current=Math.max(0,INVOICE_REVIEW.current-1);invoiceRenderReview()}else if(action==='invoice-next'){INVOICE_REVIEW.current++;invoiceRenderReview()}else if(action==='import-modal'){importModal()}else if(action==='reset-modal'){resetModal(b.dataset.mode)}else if(action==='new-admin'){modalNewAdmin()}else if(action==='change-pass'){modalPassword(id)}else if(action==='toggle-user'){if(!confirm('¿Cambiar el estado de este acceso?'))return;await adapter.toggleUser(id);notify('Estado actualizado.');if(STORE.appMode==='demo')render()}
  else if(action==='export-surplus'){await exportXlsx(surplusCSV(),'puntofarma_sobrantes_manuales.xlsx')}else if(action==='export-counts'){await exportXlsx(countCSV(),'puntofarma_conteos.xlsx')}else if(action==='export-expiry'){await exportXlsx([...STORE.counts.map(c=>{const p=STORE.products.find(x=>x.id===c.skuId);return {codigo:p?.code||'',producto:p?.name||'',colaborador:c.name,posicion:c.position,cantidad:c.qty,caducidad:formatDate(c.expiry),registro:c.createdAt||'',origen:'Conteo físico'}}).filter(x=>x.caducidad),...surplusCSV()],'puntofarma_caducidades.xlsx')}else if(action==='export-inventory'){await exportXlsx(STORE.products.map(p=>({codigo:p.code,producto:p.name,categoria:p.category,presentacion:p.presentation,teorico:p.theoretical,costoTotal:p.costTotal})),'puntofarma_inventario.xlsx')}
  else if(action==='first-firebase'){showModal('Primer supervisor en Firebase',`<form class="form-stack" data-form="first-firebase"><div class="note">Primero debes crear el proyecto Firebase y aplicar las reglas de seguridad incluidas. El alta inicial crea la cuenta web; luego debes autorizar su UID una sola vez desde Firestore. Este paso evita que cualquier visitante se convierta en supervisor.</div><div class="field"><label>Usuario</label><input class="input" name="username" required minlength="3" pattern="[a-zA-Z0-9._-]+"></div><div class="field"><label>Nombre visible</label><input class="input" name="displayName" required></div><div class="field"><label>Contraseña</label><input class="input" name="password" type="password" minlength="6" required></div><div class="dialog-footer"><button class="btn btn-primary">Crear cuenta inicial</button></div></form>`)}
  }catch(err){notify(err.message||'Ocurrió un error.','error')}});
@@ -1931,6 +2228,9 @@ document.addEventListener('submit',async e=>{let form=e.target.closest('form[dat
    if(STORE.appMode==='demo')render();
    break;
  }
+ case 'pf-daily-manual-prepare':{pfDailyManualPrepare(fd);break}
+ case 'pf-daily-upload':{const file=form.querySelector('input[type=file]')?.files?.[0];if(!file)throw Error('Selecciona el Excel.');await pfDailyRead(file,String(fd.mode||'final'));break}
+ case 'pf-daily-apply':{if(fd.confirmed!=='yes')throw Error('Confirma que revisaste los datos.');await pfDailyApply();break}
  case 'invoice-upload':{const file=form.querySelector('input[type=file]')?.files?.[0];if(!file)throw Error('Selecciona un Excel o CSV de facturas.');await invoiceOpenPreview(file);break}
  case 'invoice-apply':{await invoiceApply();break}
  case 'invoice-links':{await invoiceApplyLinks();break}
