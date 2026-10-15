@@ -1482,15 +1482,16 @@ function pfDailyOpen(){
  if(STORE.role!=='supervisor'||!STORE.ready||!STORE.connected){notify('Abre Supervisión y espera la conexión de Firebase.','error');return}
  BULK_UPDATE_REVIEW=null;
  showModal('Actualizar inventario',`<div class="form-stack">
- <div class="note"><b>Elige qué contiene tu Excel.</b> Puedes cambiar el PVP junto al stock. Los campos vacíos no se modifican.</div>
+ <div class="note"><b>Busca por código o nombre</b> para corregir un producto, o carga un Excel para actualizar varios. El sistema detectará coincidencias en el inventario actual y pedirá confirmación cuando haya dudas.</div>
+ <button type="button" class="btn btn-primary" style="width:100%;margin:5px 0 12px" data-action="pf-daily-manual">${I('search')} Buscar producto para actualizar stock o PVP</button>
  <form class="form-stack" data-form="pf-daily-upload">
  <div class="field"><label>Tipo de actualización</label><select name="mode" class="input" required>
  <option value="final">Stock final y/o PVP (establecer existencias actuales)</option>
  <option value="ventas">Ventas del período y/o PVP (descontar unidades vendidas)</option>
  </select></div>
- <div class="import-zone">${I('file')}<b>Archivo Excel (.xlsx) o CSV</b><span class="small muted">Usa el botón Plantilla Excel y completa Stock nuevo, Unidades vendidas o PVP nuevo.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div>
+ <div class="import-zone">${I('file')}<b>Actualizar varios productos por Excel</b><span class="small muted">Acepta Código y/o Producto, además de Stock nuevo, Unidades vendidas o PVP nuevo. Se comprueban coincidencias antes de guardar.</span><input type="file" name="file" accept=".xlsx,.xls,.csv" required></div>
  <div class="invoice-note">No cargues una factura de compra aquí: las compras se <b>suman</b> por el flujo «Agregar stock por factura». El stock final <b>reemplaza</b> solo los códigos incluidos; las ventas <b>restan</b> unidades.</div>
- <div class="dialog-footer" style="flex-wrap:wrap"><button type="button" class="btn btn-outline" data-action="pf-daily-manual">Editar un producto</button><button type="button" class="btn btn-outline" data-action="pf-daily-template">${I('download')} Plantilla Excel</button><button type="button" class="btn btn-outline" data-action="update-theory">Agregar stock por factura</button><button type="submit" class="btn btn-primary">Revisar cambios</button></div>
+ <div class="dialog-footer" style="flex-wrap:wrap"><button type="button" class="btn btn-outline" data-action="pf-daily-template">${I('download')} Plantilla Excel</button><button type="button" class="btn btn-outline" data-action="update-theory">Agregar stock por factura</button><button type="submit" class="btn btn-primary">Revisar cambios</button></div>
  </form></div>`);
 }
 function pfDailyManualOpen(){
@@ -1559,57 +1560,151 @@ function pfDailyNumber(raw,money=false){
  if(!/^[+]?(?:\d+)(?:\.\d+)?$/.test(s))return NaN;
  const n=Number(s);return Number.isFinite(n)&&(money?n>=0&&n<=999999:Number.isSafeInteger(n)&&n>=0&&n<=10000000)?n:NaN;
 }
-function pfDailyMatch(code,name){
- const same=STORE.products.filter(p=>String(p.code||'').trim()===code);
- if(same.length===1)return same[0];
- if(same.length>1&&name){const exact=same.filter(p=>norm(p.name).trim()===norm(name).trim());if(exact.length===1)return exact[0]}
- return null;
+function pfDailyCode(raw){return String(raw??'').trim().replace(/\.0$/,'')}
+function pfDailyName(raw){return norm(raw).replace(/\s+/g,' ').trim()}
+function pfDailySearchCandidates(line,custom=''){
+ const wanted=pfDailyName(custom||line.name||line.code);
+ const tokens=wanted.split(' ').filter(Boolean);
+ const code=pfDailyCode(line.code);
+ if(!code&&!tokens.length)return [];
+ const scored=[];
+ for(const p of STORE.products){
+   const pc=pfDailyCode(p.code),pn=pfDailyName(p.name);
+   let rank=0;
+   if(code&&pc===code)rank=120;
+   else if(code&&pc.includes(code)&&code.length>=3)rank=65;
+   if(tokens.length){
+     if(pn===wanted)rank+=90;
+     else if(pn.includes(wanted)&&wanted.length>=4)rank+=55;
+     else {const hits=tokens.filter(t=>t.length>1&&(pn.includes(t)||pc.includes(t))).length;
+       if(hits>=Math.min(2,tokens.length))rank+=Math.round(38*hits/tokens.length);
+     }
+   }
+   if(rank>0)scored.push({p,rank});
+ }
+ scored.sort((a,b)=>b.rank-a.rank||String(a.p.name).localeCompare(String(b.p.name),'es'));
+ return scored.slice(0,12).map(x=>x.p);
+}
+function pfDailyDetect(code,name){
+ const barcode=pfDailyCode(code),n=pfDailyName(name);
+ if(barcode){
+   const same=STORE.products.filter(p=>pfDailyCode(p.code)===barcode);
+   if(same.length===1)return {product:same[0],method:'Código exacto'};
+   if(same.length>1&&n){const exact=same.filter(p=>pfDailyName(p.name)===n);
+     if(exact.length===1)return {product:exact[0],method:'Código + nombre'};
+   }
+   // Nunca asignar automáticamente por nombre si el Excel trae un código distinto.
+   return {product:null,method:same.length?'Código duplicado: confirmar presentación':'Código no reconocido: confirmar'};
+ }
+ if(n){const exact=STORE.products.filter(p=>pfDailyName(p.name)===n);
+   if(exact.length===1)return {product:exact[0],method:'Nombre exacto'};
+   return {product:null,method:exact.length?'Nombre repetido: confirmar':'Nombre aproximado: confirmar'};
+ }
+ return {product:null,method:'Sin identificación'};
+}
+function pfDailyMapOptions(line){
+ const chosen=STORE.products.find(p=>p.id===line.id);
+ const options=pfDailySearchCandidates(line,line.query);
+ if(chosen&&!options.some(p=>p.id===chosen.id))options.unshift(chosen);
+ return `<option value="">Selecciona el producto correcto...</option>${options.map(p=>`<option value="${escapeHtml(String(p.id))}" ${line.id===p.id?'selected':''}>${escapeHtml(String(p.code))} — ${escapeHtml(String(p.name))} (stock ${Number(p.theoretical)||0})</option>`).join('')}`;
+}
+function pfDailyMappingDisplay(){
+ const rev=BULK_UPDATE_REVIEW;if(!rev)return;
+ const pending=rev.lines.filter(x=>!x.id);
+ if(!pending.length){pfDailyBuildReview();return}
+ showModal('Identificar productos del Excel',`<div class="form-stack">
+ <div class="note"><b>${pending.length} de ${rev.lines.length} filas necesitan revisión.</b> La búsqueda se hace en el catálogo ya descargado, sin consultas nuevas a Firebase. No se guardará nada hasta que todas estén identificadas y confirmes la vista previa.</div>
+ <div class="invoice-preview-scroller" style="max-height:460px">${pending.slice(0,50).map(line=>`<section class="surface pad" style="margin:8px 0;padding:10px 12px">
+ <strong>Fila ${line.lineNum}</strong> <span class="muted small">${escapeHtml(line.method)}</span>
+ <div class="small" style="margin:5px 0">Excel: <b>${escapeHtml(line.code||'Sin código')}</b> — ${escapeHtml(line.name||'Sin nombre')} · ${line.qty===null?'Sin cambio de cantidad':'Cantidad '+line.qty} · ${line.pvp===null?'Sin cambio de PVP':'PVP $'+line.pvp.toFixed(2)}</div>
+ <div class="field"><label>Buscar en el inventario por código o nombre</label><input class="input" data-pf-daily-query="${line.lineNum}" value="${escapeHtml(line.query||'')}" placeholder="Escribe cualquier parte del nombre o código"></div>
+ <div class="field"><label>Coincidencia encontrada</label><select class="input" data-pf-daily-match="${line.lineNum}">${pfDailyMapOptions(line)}</select></div>
+ </section>`).join('')}</div>
+ ${pending.length>50?`<p class="muted small">Mostrando las primeras 50 pendientes. Continúa con las siguientes después de asignarlas.</p>`:''}
+ <form data-form="pf-daily-map" class="dialog-footer"><button type="button" class="btn btn-outline" data-action="stock-price-open">Cancelar</button><button type="submit" class="btn btn-primary">Comprobar coincidencias</button></form></div>`);
+ document.querySelector('#modal-layer .dialog')?.style.setProperty('max-width','950px');
+}
+function pfDailyPick(lineNum,id){
+ const rev=BULK_UPDATE_REVIEW,line=rev?.lines.find(x=>x.lineNum===Number(lineNum));if(!line)return;
+ if(id&&STORE.products.some(p=>p.id===id)){line.id=id;line.method='Seleccionado manualmente';}
+ else line.id=null;
+}
+function pfDailyBuildReview(){
+ const review=BULK_UPDATE_REVIEW;if(!review)throw Error('No hay archivo pendiente.');
+ if(review.lines.some(x=>!x.id)){pfDailyMappingDisplay();return}
+ const data=new Map(),issues=[],skipped=[];
+ for(const line of review.lines){
+   const product=STORE.products.find(p=>p.id===line.id);
+   if(!product){issues.push(`Fila ${line.lineNum}: producto eliminado o inexistente`);continue}
+   const prev=data.get(product.id);
+   if(prev){
+     if(review.mode==='ventas'){
+       if(line.qty!==null)prev.qty=(prev.qty??0)+line.qty;
+       if(line.pvp!==null&&prev.pvp!==null&&line.pvp!==prev.pvp){issues.push(`Fila ${line.lineNum}: dos PVP diferentes para ${product.code}`);continue}
+       if(line.pvp!==null)prev.pvp=line.pvp;
+     }else{
+       if((line.qty!==null&&prev.qty!==null&&prev.qty!==line.qty)||(line.pvp!==null&&prev.pvp!==null&&line.pvp!==prev.pvp)){
+         issues.push(`Fila ${line.lineNum}: dos cantidades o PVP distintos para ${product.code}`);continue;
+       }
+       if(line.qty!==null)prev.qty=line.qty;
+       if(line.pvp!==null)prev.pvp=line.pvp;
+     }
+     prev.via=prev.via===line.method?prev.via:'Varias filas';
+   }else data.set(product.id,{id:product.id,code:product.code,name:product.name,qty:line.qty,pvp:line.pvp,
+       via:line.method,initialQty:Number(product.theoretical)||0,initialPvp:product.pvp==null?null:Number(product.pvp)});
+ }
+ const rows=[];
+ for(const x of data.values()){
+   const resulting=review.mode==='ventas'?x.initialQty-(x.qty||0):(x.qty??x.initialQty);
+   if(!Number.isSafeInteger(resulting)||resulting<0||resulting>10000000){issues.push(`${x.code}: no hay stock suficiente o cantidad fuera de rango`);continue}
+   if(resulting===x.initialQty&&(x.pvp===null||x.pvp===x.initialPvp)){skipped.push(x.code);continue}
+   rows.push({...x,resulting});
+ }
+ if(issues.length)throw Error(`Corrige ${issues.length} novedad(es): ${issues.slice(0,4).join(' · ')}. No se guardó nada.`);
+ if(!rows.length)throw Error('El archivo no contiene cambios nuevos de stock o PVP.');
+ review.rows=rows;review.skipped=skipped.length;
+ pfDailyReviewDisplay();
 }
 async function pfDailyRead(file,mode){
- if(!['final','ventas'].includes(mode))throw Error('Selecciona un modo válido.');
+ if(!['final','ventas'].includes(mode))throw Error('Selecciona un tipo de actualización válido.');
  if(!file||file.size>12*1024*1024)throw Error('Selecciona un archivo de hasta 12 MB.');
  const raw=await invoiceRawRows(file);
  if(!raw.length||raw.length>15000)throw Error('Excel vacío o demasiado grande. Máximo 15.000 filas.');
- const data=new Map(),issues=[],skipped=[];
+ const lines=[],issues=[];
  for(let i=0;i<raw.length;i++){
    const record=pfDailyKeyMap(raw[i]);
-   const code=pfDailyField(record,['Código','Codigo de barras','Codigo barras','SKU','Code']).replace(/\.0$/,'').trim();
-   const name=pfDailyField(record,['Producto','Nombre','Descripción','Descripcion','Item','Item / Producto']);
-   const qtyText=mode==='ventas'?pfDailyField(record,['Unidades vendidas','Cantidad vendida','Vendidas','Cantidad ventas','Cantidad']):pfDailyField(record,['Stock nuevo','Nuevo stock','Stock final','Stock actualizado','Existencia nueva','Existencias nuevas']);
-   const priceText=pfDailyField(record,['PVP nuevo','Nuevo PVP','Precio nuevo','Precio de venta nuevo','PVP','Precio venta']);
+   const code=pfDailyCode(pfDailyField(record,['Código','Codigo de barras','Codigo barras','SKU','Code','Cod','Cod Barras','Codigo del producto']));
+   const name=pfDailyField(record,['Producto','Nombre','Descripción','Descripcion','Item','Item / Producto','Descripcion del producto','Nombre producto']);
+   const qtyText=mode==='ventas'?pfDailyField(record,['Unidades vendidas','Cantidad vendida','Vendidas','Cantidad ventas','Cantidad']):pfDailyField(record,['Stock nuevo','Nuevo stock','Stock final','Stock actualizado','Existencia nueva','Existencias nuevas','Cantidad nueva','Qty stock','Stock','Existencia','Existencias','Cantidad','Qty']);
+   const priceText=pfDailyField(record,['PVP nuevo','Nuevo PVP','Precio nuevo','Precio de venta nuevo','PVP','Precio venta','Precio actualizado','Precio de venta','Precio publico']);
    if(qtyText===''&&priceText==='')continue;
-   if(!code){issues.push(`Fila ${i+2}: falta el código`);continue}
-   const product=pfDailyMatch(code,name);
-   if(!product){issues.push(`Fila ${i+2}: código ${code} no encontrado o repetido sin nombre exacto`);continue}
+   if(!code&&!name){issues.push(`Fila ${i+2}: falta código o nombre`);continue}
    const qty=pfDailyNumber(qtyText),pvp=pfDailyNumber(priceText,true);
-   if(Number.isNaN(qty)||Number.isNaN(pvp)||pvp===0){issues.push(`Fila ${i+2}: stock, ventas o PVP inválidos`);continue}
-   if(mode==='ventas'&&qty===0){issues.push(`Fila ${i+2}: la cantidad vendida debe ser mayor que cero`);continue}
-   const prev=data.get(product.id);
-   if(prev){
-     if(mode==='ventas'){
-       if(qty!==null)prev.qty=(prev.qty??0)+qty;
-       if(pvp!==null&&prev.pvp!==null&&pvp!==prev.pvp){issues.push(`Fila ${i+2}: dos precios distintos para ${code}`);continue}
-       if(pvp!==null)prev.pvp=pvp;
-     }else if((qty!==null&&prev.qty!==null&&prev.qty!==qty)||(pvp!==null&&prev.pvp!==null&&prev.pvp!==pvp)){
-       issues.push(`Fila ${i+2}: dos cantidades o PVP distintos para ${code}`);
-     }else {if(qty!==null)prev.qty=qty;if(pvp!==null)prev.pvp=pvp}
-   }else data.set(product.id,{id:product.id,code:product.code,name:product.name,qty,pvp,initialQty:Number(product.theoretical)||0,initialPvp:product.pvp==null?null:Number(product.pvp)});
+   if(Number.isNaN(qty)||Number.isNaN(pvp)||pvp===0||mode==='ventas'&&qty===0){issues.push(`Fila ${i+2}: cantidad o PVP inválidos`);continue}
+   const detected=pfDailyDetect(code,name);
+   lines.push({lineNum:i+2,code,name,qty,pvp,id:detected.product?.id||null,
+     method:detected.method,query:name||code});
  }
- if(issues.length)throw Error(`Revisa ${issues.length} fila(s). ${issues.slice(0,4).join(' · ')}. Ningún dato fue modificado.`);
- const rows=[];
- for(const a of data.values()){
-   const resulting=mode==='ventas'?a.initialQty-(a.qty||0):(a.qty??a.initialQty);
-   if(!Number.isSafeInteger(resulting)||resulting<0||resulting>10000000){issues.push(`${a.code}: las ventas exceden el stock o la cantidad está fuera de rango`);continue}
-   if(resulting===a.initialQty&&(a.pvp===null||a.pvp===a.initialPvp)){skipped.push(a.code);continue}
-   rows.push({...a,resulting});
- }
- if(issues.length)throw Error(`${issues.slice(0,4).join(' · ')}. Ningún dato fue modificado.`);
- if(!rows.length)throw Error('El Excel no contiene cambios de stock ni de PVP respecto al inventario cargado.');
+ if(issues.length)throw Error(`Corrige ${issues.length} fila(s): ${issues.slice(0,4).join(' · ')}. No se ha modificado nada.`);
+ if(!lines.length)throw Error('El archivo no contiene valores para cambiar. Completa Stock nuevo, Unidades vendidas o PVP nuevo.');
  const digest=await crypto.subtle.digest('SHA-256',await file.arrayBuffer());
  const hash=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('').slice(0,36);
- BULK_UPDATE_REVIEW={rows,mode,fileName:file.name,importKey:'ajuste-'+mode+'-'+hash,applied:false,skipped:skipped.length};
- pfDailyReviewDisplay();
+ BULK_UPDATE_REVIEW={lines,rows:[],mode,fileName:file.name,importKey:'ajuste-'+mode+'-'+hash,applied:false,skipped:0};
+ if(lines.some(x=>!x.id))pfDailyMappingDisplay();else pfDailyBuildReview();
 }
+// Los cuadros de búsqueda y coincidencias filtran únicamente el catálogo en memoria.
+document.addEventListener('input',e=>{
+ const input=e.target.closest?.('[data-pf-daily-query]');if(!input||!BULK_UPDATE_REVIEW)return;
+ const line=BULK_UPDATE_REVIEW.lines.find(x=>x.lineNum===Number(input.dataset.pfDailyQuery));if(!line)return;
+ line.query=input.value;line.id=null;
+ const select=document.querySelector(`select[data-pf-daily-match="${line.lineNum}"]`);
+ if(select)select.innerHTML=pfDailyMapOptions(line);
+});
+document.addEventListener('change',e=>{
+ const select=e.target.closest?.('[data-pf-daily-match]');if(!select)return;
+ pfDailyPick(Number(select.dataset.pfDailyMatch),select.value);
+});
+
 function pfDailyReviewDisplay(){
  const review=BULK_UPDATE_REVIEW;if(!review)return;
  const stockChanges=review.rows.filter(r=>r.resulting!==r.initialQty).length;
@@ -1617,7 +1712,7 @@ function pfDailyReviewDisplay(){
  showModal('Confirmar actualización',`<div class="form-stack">
  <div class="note"><b>${review.mode==='ventas'?'DESCONTAR VENTAS':'ACTUALIZAR STOCK FINAL'}.</b> Se modificarán únicamente ${review.rows.length} productos. ${stockChanges} cambios de stock y ${priceChanges} de PVP. Los precios vacíos permanecen intactos.</div>
  <div class="invoice-preview-scroller"><table class="invoice-review-table"><thead><tr><th>Código / producto</th><th>Stock antes</th><th>Stock después</th><th>PVP antes</th><th>PVP después</th></tr></thead><tbody>
- ${review.rows.slice(0,150).map(r=>`<tr><td><strong>${escapeHtml(String(r.code))}</strong><small style="display:block">${escapeHtml(String(r.name))}</small></td><td>${r.initialQty}</td><td><b>${r.resulting}</b></td><td>${r.initialPvp==null?'Sin PVP':'$'+r.initialPvp.toFixed(2)}</td><td>${r.pvp==null?'Sin cambios':'$'+r.pvp.toFixed(2)}</td></tr>`).join('')}
+ ${review.rows.slice(0,150).map(r=>`<tr><td><strong>${escapeHtml(String(r.code))}</strong><small style="display:block">${escapeHtml(String(r.name))} · ${escapeHtml(String(r.via||'Identificado'))}</small></td><td>${r.initialQty}</td><td><b>${r.resulting}</b></td><td>${r.initialPvp==null?'Sin PVP':'$'+r.initialPvp.toFixed(2)}</td><td>${r.pvp==null?'Sin cambios':'$'+r.pvp.toFixed(2)}</td></tr>`).join('')}
  </tbody></table></div>
  ${review.rows.length>150?`<p class="muted small">Se muestran 150 de ${review.rows.length} filas. Se aplicarán todos los cambios revisados en el archivo.</p>`:''}
  <form class="form-stack" data-form="pf-daily-apply"><div class="field"><label><input type="checkbox" name="confirmed" value="yes" required> Confirmo las cantidades y precios. Sé que el stock actualizado afectará las diferencias con los conteos históricos.</label></div>
@@ -2229,6 +2324,7 @@ document.addEventListener('submit',async e=>{let form=e.target.closest('form[dat
    break;
  }
  case 'pf-daily-manual-prepare':{pfDailyManualPrepare(fd);break}
+ case 'pf-daily-map':{pfDailyBuildReview();break}
  case 'pf-daily-upload':{const file=form.querySelector('input[type=file]')?.files?.[0];if(!file)throw Error('Selecciona el Excel.');await pfDailyRead(file,String(fd.mode||'final'));break}
  case 'pf-daily-apply':{if(fd.confirmed!=='yes')throw Error('Confirma que revisaste los datos.');await pfDailyApply();break}
  case 'invoice-upload':{const file=form.querySelector('input[type=file]')?.files?.[0];if(!file)throw Error('Selecciona un Excel o CSV de facturas.');await invoiceOpenPreview(file);break}
