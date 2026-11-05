@@ -566,7 +566,7 @@ const firebaseAdapter={
  async releaseRecount(skuId){const {fsm,db}=fb,ref=fsm.doc(db,'recounts',skuId);await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(!snap.exists()||snap.data().status!=='in_progress')throw Error('El reconteo ya no está activo.');if(STORE.role!=='supervisor'&&snap.data().assignedUid!==STORE.uid)throw Error('No tienes permiso para liberar este código.');tx.update(ref,{status:'pending',assignedUid:'',assignedName:'',attemptId:'',claimedAt:'',updatedAt:now()})})},
  async saveRecountEntry(entry){const t=STORE.recounts.find(x=>x.skuId===entry.skuId);if(!t||t.status!=='in_progress'||t.assignedUid!==STORE.uid)throw Error('No tienes reservado el código.');await fb.fsm.setDoc(fb.fsm.doc(fb.db,'recount_entries',entry.id),{...entry,attemptId:t.attemptId})},
  async deleteRecountEntry(id){const e=STORE.recountEntries.find(x=>x.id===id),t=STORE.recounts.find(x=>x.skuId===e?.skuId);if(!e||e.uid!==STORE.uid||t?.status!=='in_progress'||t.assignedUid!==STORE.uid||t.attemptId!==e.attemptId)throw Error('No puedes borrar este registro.');await fb.fsm.deleteDoc(fb.fsm.doc(fb.db,'recount_entries',id))},
- async finishRecount(skuId){const {fsm,db}=fb;const owned=await fsm.getDocs(fsm.query(fsm.collection(db,'recount_entries'),fsm.where('uid','==',STORE.uid)));if(!owned.docs.some(x=>x.data().skuId===skuId&&x.data().attemptId===STORE.recounts.find(t=>t.skuId===skuId)?.attemptId))throw Error('Primero guarda al menos un registro de reconteo.');const ref=fsm.doc(db,'recounts',skuId);await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(!snap.exists()||snap.data().status!=='in_progress'||snap.data().assignedUid!==STORE.uid)throw Error('Este código ya no está reservado para ti.');tx.update(ref,{status:'completed',completedAt:now(),updatedAt:now()})})},
+ async finishRecount(skuId){const {fsm,db}=fb;const owned=await fsm.getDocs(fsm.query(fsm.collection(db,'recount_entries'),fsm.where('skuId','==',skuId)));if(!owned.docs.some(x=>x.data().uid===STORE.uid&&x.data().attemptId===STORE.recounts.find(t=>t.skuId===skuId)?.attemptId))throw Error('Primero guarda al menos un registro de reconteo.');const ref=fsm.doc(db,'recounts',skuId);await fsm.runTransaction(db,async tx=>{const snap=await tx.get(ref);if(!snap.exists()||snap.data().status!=='in_progress'||snap.data().assignedUid!==STORE.uid)throw Error('Este código ya no está reservado para ti.');tx.update(ref,{status:'completed',completedAt:now(),updatedAt:now()})})},
  async resetData(mode){
    if(STORE.role!=='supervisor'||!fb.auth.currentUser||!STORE.connected)throw Error('Se requiere Supervisión conectada a Firebase.');
    const {fsm,db}=fb;
@@ -1423,7 +1423,13 @@ let PF_SESSION=null, PF_SESSIONS=[], PF_STOCK_MOVEMENTS=[], PF_ENTRY_PENDING=nul
 const PF_CYCLE_REF='active_inventory';
 function pfSessionIncludes(id){return !PF_SESSION||PF_SESSION.status!=='active'||PF_SESSION.scope==='all'||(PF_SESSION.skuIds||[]).includes(id)}
 function pfCountIsActive(c){return !!PF_SESSION&&PF_SESSION.status==='active'&&String(c.createdAt||'')>=PF_SESSION.startedAt&&pfSessionIncludes(c.skuId||c.linkedSkuId)}
+let pfCycleLoadPending=null;
 async function pfLoadCycles(){
+ if(pfCycleLoadPending)return pfCycleLoadPending;
+ pfCycleLoadPending=pfLoadCyclesInternal();
+ try{return await pfCycleLoadPending}finally{pfCycleLoadPending=null}
+}
+async function pfLoadCyclesInternal(){
  if(STORE.appMode==='demo'){PF_SESSIONS=loadDemo('pf_cycles',[]);PF_SESSION=PF_SESSIONS.find(s=>s.status==='active')||null;PF_STOCK_MOVEMENTS=loadDemo('pf_movements',[]);return}
  const {fsm,db}=fb;
  const [cycles,movements]=await Promise.all([fsm.getDocs(fsm.collection(db,'inventory_cycles')),fsm.getDocs(fsm.collection(db,'stock_movements'))]);
@@ -1545,7 +1551,13 @@ async function dailyStockPreview(file){
 }
 
 // Reportes de existencias: variaciones estimadas, no facturación ni ventas confirmadas.
+let pfSalesLoadPending=null;
 async function pfFetchSalesReports(){
+ if(pfSalesLoadPending)return pfSalesLoadPending;
+ pfSalesLoadPending=pfFetchSalesReportsInternal();
+ try{return await pfSalesLoadPending}finally{pfSalesLoadPending=null}
+}
+async function pfFetchSalesReportsInternal(){
  PF_SALES_ERROR='';
  try {
   if(STORE.appMode==='demo') {PF_SALES_REPORTS=loadDemo('pf_sales_reports',[]);return;}
